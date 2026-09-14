@@ -76,25 +76,57 @@ slot's delay timer releases a request. `crawler/dispatch.py` stamps
 `tests/test_dispatch.py` locks this in against a local HTTP server: four
 requests on one slot with a 2 second delay must dispatch 2 seconds apart.
 
-## Measured results (macOS dev machine, 20 seeds)
+## Measured results (20 seeds)
 
-| Metric | `CONCURRENT_REQUESTS=20` | `CONCURRENT_REQUESTS=200` |
-|---|---|---|
-| Wall time | 302s | 536s |
-| Requests | 465 | 1,657 |
-| 2xx rate | 100% | 100% |
-| Domains touched | 442 | 1,442 |
-| Unique discovered URLs | 25,297 | 81,481 |
-| Links per page | 81.0 | 79.4 |
-| Unique new URLs per page | 54.4 | 49.2 |
-| pages/sec | 1.54 | 3.09 |
-| Latency p50 / p90 | 0.29s / 0.82s | 0.36s / 1.15s |
-| Peak memory | 249 MB | 511 MB |
-| Politeness violations | **0** (min gap 4.999s) | **0** (min gap 4.996s) |
-| robots.txt violations | **0** | not re-run |
+| Metric | macOS, c=20 | macOS, c=200 | leepc, c=200 |
+|---|---|---|---|
+| Wall time | 302s | 536s | 660s |
+| Requests | 465 | 1,657 | 3,610 |
+| Domains touched | 442 | 1,442 | 3,081 |
+| Domains seen | — | — | 12,269 |
+| Unique discovered URLs | 25,297 | 81,481 | 175,903 |
+| Unique new URLs per page | 54.4 | 49.2 | 48.7 |
+| pages/sec | 1.54 | 3.09 | 5.53 |
+| Peak memory | 249 MB | 511 MB | 1,078 MB |
+| Politeness violations | **0** (4.999s) | **0** (4.996s) | **0** (4.990s) |
 
-Compliance held unchanged at 10x concurrency, which is the property that
-matters: the limit is enforced per slot, so it does not degrade under load.
+Compliance held unchanged at 10x concurrency and on a second machine, which is
+the property that matters: the limit is enforced per slot, so it does not
+degrade under load.
+
+`unique new URLs per page` sits near 50 on every run and on both machines. It
+is the most stable number here, which makes it the right basis for projecting
+the discovered metric.
+
+All three runs are still ramping up. leepc had touched 3,081 domains but
+*seen* 12,269 when it stopped, so the frontier was nowhere near steady state
+and none of these rates can be extrapolated to 48 hours yet.
+
+### A cross-domain redirect bypassed the rate limit
+
+leepc's first run reported two violations, both on `developers.google.com`,
+one pair dispatched at an identical timestamp.
+
+Scrapy's `RedirectMiddleware` builds the follow-up request with
+`source_request.replace(url=...)`, which copies meta wholesale. The stale
+`download_slot` travels with it, so a redirect from `youtube.com` to
+`google.com` lands on youtube's timer and skips google's entirely. That run
+followed 3,110 redirects, which was enough to collide.
+
+`crawler/middlewares/redirect.py` re-keys the slot on the destination URL.
+The re-run reported 0 violations.
+
+The macOS runs never exposed this. They were too slow to accumulate enough
+cross-domain redirects. The general lesson is that a single `DOWNLOAD_DELAY`
+setting does not deliver politeness on its own: every internal path that
+manufactures a new request has to be audited.
+
+### The fd limit is the first ceiling, not memory
+
+WSL's default `ulimit -n` is 1024. `CONCURRENT_REQUESTS=200` plus DNS sockets
+and log handles approaches it, so raising concurrency hits
+"too many open files" before memory or bandwidth. The hard limit is 1048576,
+so `ops/run_hour.sh` simply raises the soft limit at startup.
 
 ## Throughput is bounded by domain count, not by the machine
 
@@ -157,10 +189,14 @@ crawler/filters.py                canonicalization and trap filtering
 crawler/logwriter.py              gzipped TSV writers
 crawler/middlewares/slot.py       assigns download_slot
 crawler/middlewares/robots.py     robots.txt + Crawl-delay
+crawler/middlewares/redirect.py   re-keys the slot across redirects
 crawler/spiders/broad.py          the crawler
 ops/verify_politeness.py          proves the rate limit held
 ops/verify_robots.py              proves robots.txt was respected
 ops/report_metrics.py             Tier 1 metrics and projection
+ops/run_hour.sh                   long run with resource sampling
+ops/report_growth.py              fits the memory and domain growth curves
+ops/LEEPC_SETUP.md                WSL2 host setup and tuning
 tests/test_dispatch.py            dispatch timer regression test
 tests/seeds_smoke.txt             20 seeds for the smoke run
 ```
@@ -175,3 +211,11 @@ dispatch_ts  recv_ts  url  status  content_type  n_links
 
 `data/discovered*.log.gz`: one URL per line. Deduplicate with
 `sort -u` for the final count.
+
+### Known limit in the analysis path
+
+`ops/report_metrics.py` holds every discovered URL in a Python `set` to count
+uniques. That is fine for the ~1M URLs of a one hour run. At the tens of
+millions a 48 hour run produces, the script itself would exhaust memory, so
+the final count has to come from `sort -u` on disk or from a HyperLogLog
+estimate instead.

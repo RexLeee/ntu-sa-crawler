@@ -2,8 +2,10 @@
 
 [identity]
 bot_name = "ntu-sa-crawler"
-# Contact info lets site owners reach us instead of blocking or filing an abuse report.
-user_agent = "ntu-sa-crawler/1.0 (+https://github.com/lkj20030827/ntu-sa-crawler; academic course project)"
+# Contact info lets site owners reach us instead of blocking or filing an abuse
+# report. The repo is private, so give an address that actually reaches someone
+# rather than a URL that 404s.
+user_agent = "ntu-sa-crawler/1.0 (NTU IM academic course project; contact: r14725023@ntu.edu.tw)"
 
 [politeness]
 # 0.2 qps per registered domain => 5.0s minimum gap between requests.

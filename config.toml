@@ -1,0 +1,64 @@
+# All tunable parameters live here. Code must never hardcode these values.
+
+[identity]
+bot_name = "ntu-sa-crawler"
+# Contact info lets site owners reach us instead of blocking or filing an abuse report.
+user_agent = "ntu-sa-crawler/1.0 (+https://github.com/lkj20030827/ntu-sa-crawler; academic course project)"
+
+[politeness]
+# 0.2 qps per registered domain => 5.0s minimum gap between requests.
+download_delay = 5.0
+# Scrapy randomizes delay to 0.5x-1.5x by default, which would produce 2.5s gaps.
+# Must stay 0 or we violate the rate limit.
+download_delay_jitter = 0.0
+concurrent_requests_per_domain = 1
+obey_robotstxt = true
+# Treat eTLD+1 as the politeness unit. Includes PSL private domains, so
+# foo.blogspot.com and bar.blogspot.com count as separate domains.
+include_psl_private_domains = true
+
+[crawl]
+# The binding ceiling in testing, not bandwidth: pages/sec <= this / latency.
+# 20 measured 1.54 pages/s, 200 measured 3.09 at 511 MB peak memory.
+# Raise on the target machine while watching memory and the 429 rate.
+concurrent_requests = 200
+download_timeout = 10
+download_maxsize = 524288        # 512 KB; large pages rarely carry more links
+depth_priority = 1               # positive value + FIFO queues => breadth-first order
+log_level = "INFO"
+retry_enabled = false
+cookies_enabled = false
+redirect_enabled = true
+redirect_max_times = 2
+
+[limits]
+# A single domain can yield at most 34560 pages in 48h anyway (1 per 5s).
+# Capping it frees frontier capacity for new domains, which is the real lever.
+max_crawled_per_domain = 5000
+max_queued_per_domain = 20000
+# Priority bonus for the first URL of a previously unseen domain.
+new_domain_priority_bonus = 100
+
+[filters]
+max_url_length = 2048
+max_query_params = 5
+max_path_depth = 8
+skip_extensions = [
+    "jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "bmp", "tiff",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt",
+    "zip", "gz", "tar", "bz2", "7z", "rar", "xz",
+    "mp3", "mp4", "avi", "mkv", "mov", "wmv", "flv", "wav", "ogg", "webm",
+    "css", "js", "json", "xml", "rss", "atom",
+    "exe", "dmg", "iso", "apk", "deb", "rpm",
+    "woff", "woff2", "ttf", "eot", "otf",
+]
+# Session ids explode the URL space without yielding new content.
+skip_query_keys = ["sessionid", "phpsessid", "jsessionid", "sid", "sessid", "session_id"]
+
+[paths]
+data_dir = "data"
+state_dir = "state"
+
+[test]
+seeds_file = "tests/seeds_smoke.txt"
+timeout_seconds = 600

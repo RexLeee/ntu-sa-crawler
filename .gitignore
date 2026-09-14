@@ -1,0 +1,23 @@
+# Python environment
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Crawl output: regenerated on every run, and large
+data/*.log.gz
+data/*.jsonl
+*.log
+
+# Scrapy resume state (JOBDIR)
+state/*
+!state/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

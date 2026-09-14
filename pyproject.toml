@@ -1,0 +1,18 @@
+[project]
+name = "ntu-sa-crawler"
+version = "0.1.0"
+description = "Polite broad crawler for NTU IM system architecture starter project"
+requires-python = ">=3.11"
+dependencies = [
+    "scrapy>=2.12",
+    "tldextract>=5.1",
+    "w3lib>=2.2",
+    "protego>=0.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

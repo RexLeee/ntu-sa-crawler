@@ -1,0 +1,39 @@
+# Smoke-test seeds (20 URLs).
+#
+# Deliberately includes several hosts under one registered domain so the
+# politeness verifier can prove they share a single 5s timer:
+#   *.wikipedia.org  -> wikipedia.org
+#   *.python.org     -> python.org
+#
+# Link-dense hub pages are preferred: they exercise the extractor and grow the
+# domain frontier fastest.
+
+# --- same registered domain, different hosts (eTLD+1 grouping test) ---
+https://en.wikipedia.org/wiki/Web_crawler
+https://simple.wikipedia.org/wiki/Internet
+https://commons.wikimedia.org/wiki/Main_Page
+https://www.python.org/
+https://docs.python.org/3/
+https://peps.python.org/
+
+# --- directories and hubs (high out-degree) ---
+https://curlie.org/
+https://news.ycombinator.com/
+https://lobste.rs/
+https://www.w3.org/
+https://directory.fsf.org/wiki/Main_Page
+
+# --- standards, docs, registries ---
+https://www.rfc-editor.org/
+https://www.iana.org/
+https://developer.mozilla.org/en-US/
+https://www.debian.org/
+
+# --- universities (link out widely) ---
+https://www.ntu.edu.tw/
+https://www.mit.edu/
+https://www.stanford.edu/
+
+# --- news / aggregation ---
+https://www.bbc.com/news
+https://text.npr.org/

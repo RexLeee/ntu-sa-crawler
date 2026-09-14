@@ -56,6 +56,10 @@ DOWNLOADER_MIDDLEWARES = {
     "crawler.middlewares.slot.SlotKeyMiddleware": 90,
     "scrapy.downloadermiddlewares.robotstxt.RobotsTxtMiddleware": None,
     "crawler.middlewares.robots.PoliteRobotsTxtMiddleware": 100,
+    # A cross-domain redirect would otherwise keep the source domain's slot
+    # and bypass the destination's rate limit.
+    "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": None,
+    "crawler.middlewares.redirect.SlotAwareRedirectMiddleware": 600,
 }
 
 ITEM_PIPELINES = {}

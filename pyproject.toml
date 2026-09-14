@@ -8,6 +8,7 @@ dependencies = [
     "tldextract>=5.1",
     "w3lib>=2.2",
     "protego>=0.3",
+    "rbloom>=1.5.4",
 ]
 
 [tool.ruff]

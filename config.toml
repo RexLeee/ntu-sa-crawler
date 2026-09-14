@@ -57,9 +57,30 @@ skip_extensions = [
 # Session ids explode the URL space without yielding new content.
 skip_query_keys = ["sessionid", "phpsessid", "jsessionid", "sid", "sessid", "session_id"]
 
+[memory]
+# A measured hour: 40,773 pages crawled, 1.4M URLs discovered, RSS rising
+# 1.6 MB/s with a linear fit (R^2 0.97) and no sign of flattening. The
+# frontier fills about 33x faster than a 0.2 qps drain rate empties it, so
+# every one of these is a ceiling rather than a tuning knob.
+
+# Sized for the whole 48 hours, not the current count. Past capacity the
+# false positive rate climbs sharply. 50M costs about 171 MB.
+bloom_capacity = 50_000_000
+# One wrongly dropped URL per million. At 50M that is ~50 URLs never fetched,
+# which is acceptable when the metric is aggregate volume.
+bloom_error_rate = 1e-6
+# Nothing in Scrapy caps the queue, so this is enforced by a scheduler
+# subclass. Dropped URLs are not marked as seen and can return later.
+frontier_max_size = 2_000_000
+# Hard stop well under the 9.7 GB the WSL VM has.
+memusage_limit_mb = 7000
+memusage_warning_mb = 5500
+
 [paths]
 data_dir = "data"
 state_dir = "state"
+# Without this the disk queue is inert and the whole frontier stays in RAM.
+jobdir = "state/job"
 
 [test]
 seeds_file = "tests/seeds_smoke.txt"

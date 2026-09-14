@@ -8,6 +8,8 @@ _cfg = load_config()
 _ident = _cfg["identity"]
 _pol = _cfg["politeness"]
 _crawl = _cfg["crawl"]
+_mem = _cfg["memory"]
+_state = _cfg["paths"]
 
 BOT_NAME = _ident["bot_name"]
 USER_AGENT = _ident["user_agent"]
@@ -36,11 +38,36 @@ DNSCACHE_SIZE = 200_000
 
 # --- crawl order ------------------------------------------------------------
 # Positive DEPTH_PRIORITY with FIFO queues yields breadth-first order, which
-# spreads load across domains and keeps memory bounded.
+# spreads load across domains.
 DEPTH_PRIORITY = _crawl["depth_priority"]
 SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
 SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
 SCHEDULER_PRIORITY_QUEUE = "scrapy.pqueues.DownloaderAwarePriorityQueue"
+# Required by DownloaderAwarePriorityQueue, which raises ValueError otherwise.
+CONCURRENT_REQUESTS_PER_IP = 0
+
+# --- memory ------------------------------------------------------------------
+# Without JOBDIR the disk queue above is inert: Scheduler.open skips it and
+# every queued request stays a live object in the memory queue. A measured
+# hour put 1.4M requests there and RSS rose 1.6 MB/s with no sign of
+# flattening. Setting JOBDIR is what actually moves the frontier to disk.
+JOBDIR = _state["jobdir"]
+
+# RFPDupeFilter holds every fingerprint in a set at roughly 131 bytes each,
+# which is about 6.5 GB at 50M URLs. The Bloom filter costs 171 MB instead.
+DUPEFILTER_CLASS = "crawler.dupefilter.BloomDupeFilter"
+BLOOM_DUPEFILTER_CAPACITY = _mem["bloom_capacity"]
+BLOOM_DUPEFILTER_ERROR_RATE = _mem["bloom_error_rate"]
+
+# Nothing in Scrapy caps the frontier, so a breadth-first crawl fills it about
+# 33x faster than it drains. This is the backstop.
+SCHEDULER = "crawler.scheduler.CappedScheduler"
+FRONTIER_MAX_SIZE = _mem["frontier_max_size"]
+
+# Hard stop. Defaults to 0, meaning no limit at all.
+MEMUSAGE_ENABLED = True
+MEMUSAGE_LIMIT_MB = _mem["memusage_limit_mb"]
+MEMUSAGE_WARNING_MB = _mem["memusage_warning_mb"]
 
 # --- trimming ---------------------------------------------------------------
 COOKIES_ENABLED = _crawl["cookies_enabled"]
@@ -64,5 +91,6 @@ DOWNLOADER_MIDDLEWARES = {
 
 ITEM_PIPELINES = {}
 
-REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
+# REQUEST_FINGERPRINTER_IMPLEMENTATION was removed in Scrapy 2.13. The 2.7
+# scheme is now the only one, so setting it here did nothing.
 FEED_EXPORT_ENCODING = "utf-8"

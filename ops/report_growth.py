@@ -91,15 +91,21 @@ def _describe(name: str, ts: list[float], vs: list[float], unit: str) -> None:
 def _domain_curve(crawled: Path, buckets: int = 40) -> tuple[list[float], list[float]]:
     """Cumulative distinct registered domains over time, from the crawl log."""
     stamps: list[tuple[float, str]] = []
-    with gzip.open(crawled, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            p = line.rstrip("\n").split("\t")
-            if len(p) < 3:
-                continue
-            try:
-                stamps.append((float(p[0]), slot_key(p[2])))
-            except ValueError:
-                continue
+    try:
+        with gzip.open(crawled, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 3:
+                    continue
+                try:
+                    stamps.append((float(p[0]), slot_key(p[2])))
+                except ValueError:
+                    continue
+    except EOFError:
+        # The crawl is still writing, so the final gzip member has no
+        # end-of-stream marker yet. Everything already decoded is still
+        # valid, which is what matters for inspecting a run in progress.
+        pass
     if not stamps:
         return [], []
 

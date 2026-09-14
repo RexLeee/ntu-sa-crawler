@@ -7,12 +7,55 @@ inside its WSL2 Ubuntu 26.04 distro.
 
 `wsl.exe` cannot be driven over a Tailscale SSH session. Every invocation,
 including `wsl --help`, exits 1 with no output, because it needs an
-interactive desktop session token that the SSH session does not have. The
-Windows SSH user (`rex`) is also not the desktop user (`lkj20`), so it has no
-distro of its own registered.
+interactive desktop session token that the SSH session does not have.
 
-The fix is to give WSL its own sshd and forward a port to it, so the Windows
+The fix is to give WSL its own sshd and reach it directly, so the Windows
 layer is bypassed entirely.
+
+## Reaching WSL: use Tailscale, not a port forward
+
+The first attempt forwarded Windows port 2222 into WSL with
+`netsh interface portproxy`. It is not trustworthy: measured over eight
+consecutive connections, five to six were reset during SSH key exchange. The
+TCP connect succeeds and the relay drops the session mid-handshake, so
+client-side `ConnectionAttempts` does not help.
+
+Install Tailscale inside the distro instead. WSL then holds its own address
+and SSH reaches it directly with no relay in the path. The same measurement
+over the Tailscale address: 8 of 8 connections succeeded, and a 60 second
+session held without a drop.
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sudo sh
+sudo tailscale up --hostname=leepc-wsl --accept-dns=false
+```
+
+Run that **in a WSL window on the machine**, not over SSH. `tailscale up`
+blocks until the browser authorisation completes, and any SSH disconnect in
+the meantime takes the waiting process with it.
+
+`--accept-dns=false` matters here: WSL generates `/etc/resolv.conf` from the
+Windows side, and letting Tailscale rewrite it risks breaking DNS, which a
+crawler depends on more than most workloads.
+
+Tailscale on the Windows host does not cover this. It advertises the Windows
+network stack, and the WSL guest sits behind NAT on a separate virtual
+interface. Connect with `ssh -p 2222 rex@<tailscale-ip>`.
+
+## Do not poll the VM with wsl.exe
+
+`wsl.exe -d Ubuntu -e <cmd>` is not a read-only probe. It starts the distro,
+and running it against a live distro disturbs it.
+
+A scheduled task that called it once a minute to "check the VM is alive"
+restarted `tailscaled` **30 times in 15 minutes**, roughly every 44 seconds.
+Every Tailscale login attempt died about four seconds after printing its URL,
+and the daemon kept logging `profile not found` because its state was wiped on
+each cycle. The VM looked like it was stopping on its own; in fact the probe
+was stopping it, and each observed "outage" prompted another restart.
+
+To check whether the VM is running, ask Windows instead. `Get-Process
+vmmemWSL` observes without touching the distro.
 
 ## One-time setup
 
@@ -34,22 +77,25 @@ sudo systemctl enable ssh
 sudo systemctl start ssh
 ```
 
-### 2. On Windows (Administrator PowerShell)
+### 2. Join the tailnet (from the same WSL window)
 
-WSL2 gets a new NAT address on every boot, so the forward has to be rebuilt
-each time rather than hardcoded.
+```bash
+curl -fsSL https://tailscale.com/install.sh | sudo sh
+sudo tailscale up --hostname=leepc-wsl --accept-dns=false
+tailscale ip -4
+```
+
+`tailscaled` enables itself at boot, so this is a one-time step. No port
+forward and no firewall rule are needed: the address belongs to the distro.
+
+### 2b. Port forward (superseded, kept for reference)
 
 ```powershell
-@'
 $wslIp = (wsl -d Ubuntu -e hostname -I).Trim().Split()[0]
 netsh interface portproxy delete v4tov4 listenport=2222 listenaddress=0.0.0.0 2>$null
 netsh interface portproxy add v4tov4 listenport=2222 listenaddress=0.0.0.0 connectport=2222 connectaddress=$wslIp
-'@ | Set-Content C:\Users\lkj20\wsl-portproxy.ps1
-
-powershell -ExecutionPolicy Bypass -File C:\Users\lkj20\wsl-portproxy.ps1
 New-NetFirewallRule -DisplayName "WSL SSH 2222" -Direction Inbound -LocalPort 2222 -Protocol TCP -Action Allow
 
-# rebuild the forward automatically after a reboot
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
            -Argument "-ExecutionPolicy Bypass -File C:\Users\lkj20\wsl-portproxy.ps1"
 $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -72,13 +118,17 @@ Pause Windows Update through Settings until after the run ends.
 
 ### 4. Client SSH config
 
+Point `HostName` at the distro's own tailnet address (`tailscale ip -4` inside
+WSL), not at the Windows host. 100.84.218.75 is the Windows node and reaches
+WSL only through the unreliable port forward.
+
 ```
 Host leepc-wsl
-    HostName 100.84.218.75
+    HostName 100.114.150.20
     Port 2222
     User rex
-    ServerAliveInterval 30
-    ServerAliveCountMax 6
+    ServerAliveInterval 15
+    ServerAliveCountMax 8
 ```
 
 Verify with `ssh leepc-wsl 'nproc && free -h'`.

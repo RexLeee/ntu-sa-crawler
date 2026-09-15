@@ -60,26 +60,24 @@ include_psl_private_domains = true
 # 3.82 pages/s. A parked request holds no socket and costs ~3 KB, so 12000
 # costs about 36 MB.
 #
-# Per process, and it does NOT divide by the shard count. The first sharded
-# run kept 3000 here and got slower than one process: 45.7 pages/s against
-# 54.5. Every shard sat at exactly 3000 active with only ~1,400 domain slots,
-# while the single process spread the same 3000 over 6,551 slots. A shard
-# owns a quarter of the domains, so a budget that a single process spent
-# reaching many domains gets spent stacking requests on the few this shard
-# holds, and the budget runs out before the domains do.
+# Per process, and it does NOT divide by the shard count. A sharded run that
+# kept 3000 here was slower than one process, 45.7 pages/s against 54.5: every
+# shard sat at exactly 3000 active with only ~1,400 domain slots, while the
+# single process spread the same 3000 over 6,551. A shard owns a fraction of
+# the domains, so the budget gets spent stacking requests on the few it holds
+# and runs out before the domains do. Raising it to 12000 recovered 52.29.
 #
-# The bound is domains in flight, so this has to be large enough that the
-# shard's own domain count is what limits it. Raised rather than divided.
-concurrent_requests = 12000
+# 3000 is right for the single process this runs as. Raise it when sharding.
+concurrent_requests = 3000
 download_timeout = 10
 # Scrapy's default is 60s with no negative cache (see the TODO in
 # scrapy/resolver.py). Lookups run in the reactor thread pool, so one dead
 # domain holds a thread for a full minute. In the measured run 2,118 DNS
 # failures consumed 48% of the entire pool.
 dns_timeout = 5
-# Per process, like everything sized for one shard's share of the domains. A
-# 10 minute run cached 26,344 entries; a 2 hour run reached 140,567.
-dns_cache_size = 60_000
+# A 10 minute run cached 26,344 entries; a 2 hour run reached 140,567. Per
+# process, so divide it before sharding.
+dns_cache_size = 200_000
 # DNS lookups all run here, so the pool size caps the new-domain rate. Per
 # process: 4 shards is 800 threads, which are almost all blocked on the
 # network rather than running.
@@ -150,11 +148,20 @@ follow_meta_refresh = false
 # processes and needs no shared state. That is the whole reason sharding is
 # safe here.
 #
-# Bounded by memory, not by cores. The machine has 8 cores but WSL2 is given
-# 9.9 GB, and a single process measured 1,468 MB at 10 minutes and 1,515 MB at
-# 2 hours. Every limit in [memory] below is per process, so they are divided
-# by this number rather than shared. Start at 4 and measure before raising it.
-shards = 4
+# 1, because measurement said so. Four shards reached 52.29 pages/s against
+# 54.54 for a single process, while issuing 1.7x the requests to get the same
+# number of responses back. The established TCP count and the DNS cache are
+# the same either way: the limit is the network, not the CPU, and more
+# processes only add requests that time out. See the README.
+#
+# Raising this is safe for compliance at any value, since each domain belongs
+# to exactly one process, and the machinery is kept for that reason. It will
+# only help if the link stops being the bottleneck.
+#
+# Above 1, every limit in [memory] is per process, so size them for one
+# shard's share and watch total RSS against the 9.9 GB the VM has. Four shards
+# measured 4.0 GB.
+shards = 1
 # How often each process drains the URLs other shards handed it. The poll is a
 # few file reads, and a URL waiting here is a domain not yet being crawled, so
 # this is short.
@@ -199,16 +206,13 @@ skip_query_keys = ["sessionid", "phpsessid", "jsessionid", "sid", "sessid", "ses
 # frontier fills about 33x faster than a 0.2 qps drain rate empties it, so
 # every one of these is a ceiling rather than a tuning knob.
 #
-# EVERY VALUE HERE IS PER PROCESS. With sharding.shards = 4 the machine holds
-# four of each. They are sized for one shard's share of the work, which is
-# what each process actually sees: a shard owns a quarter of the domains and
-# therefore meets roughly a quarter of the URLs.
+# EVERY VALUE HERE IS PER PROCESS, so raising sharding.shards above 1 means
+# the machine holds that many copies of each. They are sized for the single
+# process the crawl currently runs as; divide them before sharding.
 
 # Sized for the whole 48 hours, not the current count. Past capacity the
-# false positive rate climbs sharply. 50M costs about 171 MB, so a quarter of
-# that costs 51 MB and four of them cost 205 MB: sharding trades a little
-# memory for the ability to use more than one core.
-bloom_capacity = 15_000_000
+# false positive rate climbs sharply. 50M costs about 171 MB.
+bloom_capacity = 50_000_000
 # One wrongly dropped URL per million. At 50M that is ~50 URLs never fetched,
 # which is acceptable when the metric is aggregate volume.
 bloom_error_rate = 1e-6
@@ -221,18 +225,17 @@ bloom_error_rate = 1e-6
 # and after that every new URL was dropped, including the first URL of an
 # unseen domain. That is the one thing we cannot afford to drop, so
 # CappedScheduler now exempts it as well.
-frontier_max_size = 5_000_000
-# Hard stop per process. Four processes at this limit is 7.2 GB against the
-# 9.9 GB the WSL VM has, which leaves room for the page cache and the disk
-# frontier's buffers.
-memusage_limit_mb = 1800
-memusage_warning_mb = 1500
+frontier_max_size = 20_000_000
+# Hard stop well under the 9.7 GB the WSL VM has. Per process: at 4 shards
+# this has to come down to about 1800, since four measured 4.0 GB together.
+memusage_limit_mb = 7000
+memusage_warning_mb = 5500
 # Scrapy keeps every robots.txt parser it ever builds, keyed by hostname, and
 # never evicts. Measured: 0.9 KB for a one-rule file, 7.1 KB for a typical
 # one, 369 KB for a 500-rule one. That dict was the main driver of the
 # 5.3 GB RSS seen in an 87 minute run. Evicting only costs a re-fetch; the
 # robots check itself is never skipped.
-robots_cache_size = 15_000
+robots_cache_size = 50_000
 # What to do when robots.txt cannot be read at all. Scrapy's convention, and
 # the usual one, is to treat an unreadable file as permission to crawl
 # everything. The assignment says "NO violation", and the difference is not

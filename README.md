@@ -566,9 +566,46 @@ The machine has 8 cores, but WSL2 is given 9.9 GB and one process measured
 documented as such, sized for one shard's share of the work rather than the
 whole crawl's.
 
-Four shards at `bloom_capacity = 15M` cost 205 MB in total against 171 MB for
-a single process at 50M. That extra 34 MB is what sharding trades for the
-ability to use more than one core, and it is the right trade.
+### Measured: sharding did not raise throughput, because the bottleneck is the network
+
+This is the result the work was for, and it is negative.
+
+| | 1 process | 4 shards |
+|---|---|---|
+| pages/s | **54.54** | 52.29 |
+| requests issued @570s | 94,305 | **162,721** |
+| responses @570s | 44,986 | 46,144 |
+| response rate | 48% | **28%** |
+| established TCP | ~1,700 | ~1,600 |
+| DNS names cached | 25,567 | ~24,700 |
+| CPU | 99% on one thread | 23–41% each |
+
+Four processes issued 1.7x the requests and got the same number of responses
+back. The TCP connection count and the DNS cache are the same in both, which
+is the tell: the crawl is limited by how many connections this link and
+resolver will carry, not by how much CPU is available to start them. Adding
+processes only added requests that time out.
+
+The CPU column is the confirmation. After sharding no process is near
+saturation, so the reactor thread was never what capped the previous run
+either. It looked like the cap because `pop()` really had been burning it, and
+fixing that moved the limit somewhere else without anyone checking where.
+
+The first sharded attempt was slower still, at 45.66 pages/s, because
+`concurrent_requests` had been left at 3,000. That setting is a budget for
+requests parked on a domain timer, so it bounds domains in flight; a shard
+owning a quarter of the domains spends it stacking requests on the few it
+holds. Raising it to 12,000 recovered 45.66 to 52.29, which is the sharding
+overhead being paid back, not a gain.
+
+**Sharding is kept anyway**, for one reason: it is compliant, verified at 0
+violations across four processes, and it is the only structure that can use
+more bandwidth if the link ever stops being the limit. It is not switched on
+by default. `sharding.shards = 1` runs the single process that is currently
+faster.
+
+The honest summary is that the 48 hour figure is bounded by the network, and
+no amount of local parallelism changes it.
 
 ## Seed selection
 

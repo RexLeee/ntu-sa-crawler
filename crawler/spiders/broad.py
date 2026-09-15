@@ -7,10 +7,11 @@ domain from monopolising the frontier.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections import defaultdict
 
-from scrapy import Request, Spider
+from scrapy import Request, Spider, signals
 from scrapy.exceptions import CloseSpider
 
 from crawler.config import PROJECT_ROOT, data_dir, load_config
@@ -31,8 +32,12 @@ class BroadSpider(Spider):
 
     def __init__(self, seeds: str | None = None, shard: int = 0, shards: int = 1, **kw):
         super().__init__(**kw)
-        install_dispatch_timer()
         self.cfg = load_config()
+        # The hard floor the assignment sets, enforced at the last point
+        # before the socket write. DOWNLOAD_DELAY schedules above it; this
+        # catches the cases where event-loop congestion would let a pair slip
+        # under. See crawler/dispatch.py.
+        install_dispatch_timer(self.cfg["politeness"]["required_min_gap"])
         self.filter = UrlFilter(self.cfg)
 
         limits = self.cfg["limits"]
@@ -43,7 +48,8 @@ class BroadSpider(Spider):
         self.shard = int(shard)
         self.shards = int(shards)
 
-        seeds_path = seeds or self.cfg["test"]["seeds_file"]
+        # -a seeds=... wins, then the production list, then the smoke list.
+        seeds_path = seeds or self.cfg["seeds"]["seeds_file"]
         self.seeds_path = (PROJECT_ROOT / seeds_path).resolve()
 
         # Per-domain bookkeeping. Bounded by the number of domains we touch.
@@ -57,6 +63,35 @@ class BroadSpider(Spider):
         self.discovered_log = GzipLineWriter(d / f"discovered{suffix}.log.gz")
 
     # --- lifecycle ----------------------------------------------------------
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        # queued_per_domain counts requests waiting in the frontier, so every
+        # request that leaves it has to release its slot. Without this the
+        # counter only grows: an 87 minute run saw 9,684 downloads fail and
+        # 14,084 robots fetches fail, none of which reach parse(), so a busy
+        # domain hits max_queued_per_domain and is silenced for good.
+        #
+        # request_left_downloader covers both outcomes, success and failure.
+        # request_dropped covers the requests CappedScheduler refuses before
+        # they ever reach the downloader.
+        crawler.signals.connect(
+            spider._on_request_settled, signal=signals.request_left_downloader
+        )
+        crawler.signals.connect(spider._on_request_settled, signal=signals.request_dropped)
+        return spider
+
+    def _release_queued(self, key: str) -> None:
+        remaining = self.queued_per_domain.get(key, 0) - 1
+        if remaining > 0:
+            self.queued_per_domain[key] = remaining
+        else:
+            # Drop the key entirely so the dict tracks live domains only.
+            self.queued_per_domain.pop(key, None)
+
+    def _on_request_settled(self, request, spider) -> None:
+        self._release_queued(request.meta.get("download_slot") or slot_key(request.url))
 
     def start_requests(self):
         yield from self._seed_requests()
@@ -123,6 +158,9 @@ class BroadSpider(Spider):
             len(links),
         )
         self.crawled_per_domain[key] += 1
+        # The queued counter is released by the request_left_downloader
+        # signal, which fires for failures too. Doing it here as well would
+        # double-count.
 
         for url in links:
             yield from self._maybe_follow(url, response)
@@ -149,9 +187,12 @@ class BroadSpider(Spider):
         # choose not to fetch it. The metric is discovery, not fetching.
         self.discovered_log.write(url)
 
-        if self.crawled_per_domain[key] >= self.max_crawled_per_domain:
+        # .get() rather than [key]: defaultdict.__getitem__ inserts, so
+        # indexing here would grow both dicts with every DISCOVERED domain
+        # instead of every crawled one.
+        if self.crawled_per_domain.get(key, 0) >= self.max_crawled_per_domain:
             return
-        if self.queued_per_domain[key] >= self.max_queued_per_domain:
+        if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
             return
         if self.shards > 1 and self._shard_of(key) != self.shard:
             return  # another worker owns this domain
@@ -171,5 +212,19 @@ class BroadSpider(Spider):
         )
 
     def _shard_of(self, key: str) -> int:
-        # Stable across processes, unlike hash().
-        return int.from_bytes(key.encode("utf-8")[:8].ljust(8, b"\0"), "big") % self.shards
+        """Assign a domain to a worker. Stable across processes, unlike hash().
+
+        Hashes the whole key rather than its first 8 bytes. Domains share
+        prefixes heavily, so truncating skews the split. Measured over 5,994
+        real domains, max/min load per shard:
+
+            shards   first 8 bytes   md5
+                 4          1.263x   1.062x
+                 6          1.171x   1.099x
+                 8          2.012x   1.124x
+
+        At 8 workers, the value this project would use, one process would
+        otherwise carry twice the load of another while cores sit idle.
+        """
+        digest = hashlib.md5(key.encode("utf-8"), usedforsecurity=False).digest()
+        return int.from_bytes(digest[:8], "big") % self.shards

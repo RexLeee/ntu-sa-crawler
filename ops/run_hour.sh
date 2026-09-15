@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Long-duration baseline run.
+# Long-duration run with resource sampling.
 #
-# Short samples (5-11 min) are all still in ramp-up: the domain frontier was
-# still growing when they ended, so their pages/sec cannot be extrapolated.
+# Short samples (5-11 min) are all still in ramp-up: the domain frontier is
+# still growing when they end, so their pages/sec cannot be extrapolated.
 # This samples resources on a fixed interval so the growth curve can be
 # plotted, not just its endpoint.
 #
-# Usage: ops/run_hour.sh [duration_seconds]
+# Usage: ops/run_hour.sh [duration_seconds] [seeds_file]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
 
-# The soft limit is 1024. CONCURRENT_REQUESTS=200 plus DNS sockets and the
-# gzip log handles approaches that, and raising concurrency would hit
-# "too many open files" before memory or bandwidth. The hard limit is
-# 1048576, so this needs no root and no config file.
+# The soft limit is 1024. A measured run peaked at 2,021 open descriptors,
+# most of them robots.txt fetches and DNS sockets rather than page transfers.
+# The hard limit is 1048576, so this needs no root and no config file.
 ulimit -n 65536
 
 DURATION="${1:-3600}"
+SEEDS="${2:-seeds/seeds_1000.txt}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-30}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 RUNDIR="data/run-${STAMP}"
@@ -26,17 +26,30 @@ mkdir -p "$RUNDIR"
 
 # Start clean so the metrics describe this run alone.
 rm -f data/crawled.log.gz data/discovered.log.gz
+rm -rf state/job
 
 echo "run dir      : $RUNDIR"
 echo "duration     : ${DURATION}s"
+echo "seeds        : $SEEDS ($(grep -c '^https' "$SEEDS" 2>/dev/null || echo 0) urls)"
 echo "fd limit     : $(ulimit -n)"
 echo "started      : $(date -Iseconds)"
 
-uv run scrapy crawl broad \
-    -s "CLOSESPIDER_TIMEOUT=${DURATION}" \
-    --logfile "$RUNDIR/scrapy.log" &
+# No CLOSESPIDER_TIMEOUT. With a large CONCURRENT_REQUESTS its graceful
+# shutdown waits for every in-flight request to time out, which took over five
+# minutes in testing and had to be killed anyway. The logs are flushed as the
+# crawl runs, so stopping the process directly loses nothing but the final
+# gzip end-of-stream marker, which the analysis tools already tolerate.
+uv run scrapy crawl broad -a "seeds=${SEEDS}" --logfile "$RUNDIR/scrapy.log" &
 CRAWL_PID=$!
 echo "pid          : $CRAWL_PID"
+
+# Copy the logs into the run directory whatever happens, including Ctrl-C or
+# the machine being shut down. A previous run lost its final statistics
+# because this only ran on the clean-exit path.
+collect() {
+    cp data/crawled.log.gz data/discovered.log.gz "$RUNDIR/" 2>/dev/null || true
+}
+trap collect EXIT INT TERM
 
 # The crawl runs under `uv run`, so the python process is a child of the
 # recorded pid. Sample the whole tree rather than the launcher.
@@ -61,6 +74,9 @@ leaf_pid() {
     START=$(date +%s)
     while kill -0 "$CRAWL_PID" 2>/dev/null; do
         NOW=$(date +%s)
+        if [ $((NOW - START)) -ge "$DURATION" ]; then
+            break
+        fi
         LEAF=$(leaf_pid)
         RSS=$(sample_tree_rss)
         THR=$(awk '/^Threads:/{print $2}' "/proc/$LEAF/status" 2>/dev/null || echo 0)
@@ -74,8 +90,17 @@ leaf_pid() {
     done
 } > "$RUNDIR/resources.tsv"
 
-wait "$CRAWL_PID" || true
+# SIGTERM first so the dupefilter gets its chance to persist, then SIGKILL,
+# because graceful shutdown does not finish at this concurrency.
+echo "stopping     : $(date -Iseconds)"
+kill -TERM "$CRAWL_PID" 2>/dev/null || true
+for _ in $(seq 1 20); do
+    kill -0 "$CRAWL_PID" 2>/dev/null || break
+    sleep 1
+done
+kill -9 "$CRAWL_PID" 2>/dev/null || true
+wait "$CRAWL_PID" 2>/dev/null || true
 
-cp data/crawled.log.gz data/discovered.log.gz "$RUNDIR/" 2>/dev/null || true
+collect
 echo "finished     : $(date -Iseconds)"
 echo "run dir      : $RUNDIR"

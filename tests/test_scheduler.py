@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Lock in the O(1) frontier size tracking.
+
+CappedScheduler used to call len(self) on every enqueue. Scheduler.__len__
+sums over every per-domain queue, so a crawl that reached tens of thousands of
+domains spent most of its time counting instead of crawling.
+
+Two properties must hold:
+
+  * the tracked size matches the real length after any mix of operations
+  * enqueue cost does not grow with the number of domains
+
+Run: uv run python tests/test_scheduler.py
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from twisted.internet import asyncioreactor  # noqa: E402
+
+# DownloaderAwarePriorityQueue reaches the downloader, which builds handlers
+# that require an installed reactor. Install it before importing Scrapy.
+asyncioreactor.install()
+
+from scrapy import Request  # noqa: E402
+from scrapy.utils.test import get_crawler  # noqa: E402
+
+from crawler.scheduler import CappedScheduler  # noqa: E402
+from crawler.spiders.broad import BroadSpider  # noqa: E402
+
+CAP = 500
+
+
+def _scheduler(cap: int = CAP) -> CappedScheduler:
+    crawler = get_crawler(
+        BroadSpider,
+        {
+            "FRONTIER_MAX_SIZE": cap,
+            "SCHEDULER_PRIORITY_QUEUE": "scrapy.pqueues.DownloaderAwarePriorityQueue",
+            "CONCURRENT_REQUESTS_PER_IP": 0,
+            "DUPEFILTER_CLASS": "scrapy.dupefilters.BaseDupeFilter",
+        },
+    )
+    crawler._apply_settings()
+    spider = crawler._create_spider()
+    crawler.engine = crawler._create_engine()
+    scheduler = CappedScheduler.from_crawler(crawler)
+    scheduler.open(spider)
+    return scheduler
+
+
+def test_size_matches_real_length() -> bool:
+    sched = _scheduler()
+    for i in range(200):
+        sched.enqueue_request(Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"}))
+    if sched._size != len(sched):
+        print(f"FAIL: after enqueue, tracked={sched._size} real={len(sched)}")
+        return False
+
+    for _ in range(50):
+        sched.next_request()
+    if sched._size != len(sched):
+        print(f"FAIL: after dequeue, tracked={sched._size} real={len(sched)}")
+        return False
+
+    print(f"PASS: size tracking exact ({sched._size} == {len(sched)})")
+    return True
+
+
+def test_cap_is_enforced() -> bool:
+    sched = _scheduler(cap=10)
+    accepted = sum(
+        sched.enqueue_request(Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"}))
+        for i in range(50)
+    )
+    if accepted != 10:
+        print(f"FAIL: cap 10 accepted {accepted}")
+        return False
+
+    # Draining must let new requests back in, or a full frontier deadlocks.
+    sched.next_request()
+    if not sched.enqueue_request(Request("https://new.example/", meta={"download_slot": "new"})):
+        print("FAIL: cap did not release after a dequeue")
+        return False
+
+    print("PASS: cap enforced and released")
+    return True
+
+
+def test_enqueue_cost_is_flat() -> bool:
+    """Enqueue must not slow down as the domain count grows."""
+    timings = {}
+    for domains in (200, 2000):
+        sched = _scheduler(cap=10_000_000)
+        for i in range(domains):
+            sched.enqueue_request(
+                Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"})
+            )
+        start = time.perf_counter()
+        for i in range(2000):
+            sched.enqueue_request(
+                Request(f"https://probe{i}.example/", meta={"download_slot": f"p{i}"})
+            )
+        timings[domains] = (time.perf_counter() - start) / 2000
+
+    ratio = timings[2000] / timings[200]
+    # O(domains) would be ~10x here. Allow generous headroom for noise.
+    if ratio > 3.0:
+        print(f"FAIL: enqueue cost grew {ratio:.1f}x with 10x the domains")
+        return False
+
+    print(
+        f"PASS: enqueue cost flat "
+        f"({timings[200] * 1e6:.1f}us -> {timings[2000] * 1e6:.1f}us, {ratio:.2f}x)"
+    )
+    return True
+
+
+def main() -> int:
+    results = [
+        test_size_matches_real_length(),
+        test_cap_is_enforced(),
+        test_enqueue_cost_is_flat(),
+    ]
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

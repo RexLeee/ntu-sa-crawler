@@ -9,6 +9,7 @@ dependencies = [
     "w3lib>=2.2",
     "protego>=0.3",
     "rbloom>=1.5.4",
+    "aiohttp>=3.14.3",
 ]
 
 [tool.ruff]

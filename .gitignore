@@ -18,6 +18,11 @@ data/*.jsonl
 state/*
 !state/.gitkeep
 
+# Tranco download cache: 9.7 MB, and build_seeds.py re-fetches it on demand.
+# The selected seeds and the probe report are committed, since the report is
+# the evidence for why each seed was kept.
+seeds/.tranco-*.zip
+
 # OS
 .DS_Store
 Thumbs.db

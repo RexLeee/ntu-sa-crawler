@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import gzip
 import sys
 import time
 import urllib.error
@@ -26,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from protego import Protego  # noqa: E402
 
 from crawler.config import load_config  # noqa: E402
+from crawler.logwriter import read_lines  # noqa: E402
 
 
 def fetch_robots(origin: str, user_agent: str, timeout: float) -> Protego | None:
@@ -69,17 +69,16 @@ def main() -> int:
     by_origin: dict[str, list[str]] = defaultdict(list)
     total = 0
     for path in paths:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) < 3:
-                    continue
-                url = parts[2]
-                s = urlsplit(url)
-                if not s.scheme or not s.netloc:
-                    continue
-                by_origin[f"{s.scheme}://{s.netloc}"].append(url)
-                total += 1
+        for line in read_lines(path):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            url = parts[2]
+            s = urlsplit(url)
+            if not s.scheme or not s.netloc:
+                continue
+            by_origin[f"{s.scheme}://{s.netloc}"].append(url)
+            total += 1
 
     # Check the busiest origins first: they carry the most risk.
     origins = sorted(by_origin, key=lambda o: len(by_origin[o]), reverse=True)[: args.hosts]

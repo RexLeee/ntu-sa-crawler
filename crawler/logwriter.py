@@ -10,7 +10,9 @@ last buffer, not the run.
 from __future__ import annotations
 
 import gzip
+import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -36,6 +38,21 @@ class GzipLineWriter:
             self._fh.flush()
         finally:
             self._fh.close()
+
+
+def read_lines(path: Path | str) -> Iterator[str]:
+    """Yield log lines, tolerating a file the writer never closed.
+
+    The writer flushes periodically so a killed run keeps its records, but the
+    final gzip member then has no end-of-stream marker and the stdlib raises
+    EOFError at the end. Every line decoded before that point is a real record,
+    so the analysis tools must report on them rather than refuse the file.
+    """
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            yield from fh
+    except EOFError:
+        print(f"{path}: truncated, using the decoded prefix", file=sys.stderr)
 
 
 def now() -> float:

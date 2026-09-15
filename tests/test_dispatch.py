@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Prove the dispatch timer measures real request spacing.
+"""Prove the dispatch timer measures and enforces real request spacing.
 
 Run directly: uv run python tests/test_dispatch.py
 
 Uses a local HTTP server so the assertion depends on Scrapy's scheduling only,
 not on any external site. Four requests share one download slot, so their
 transfer starts must be DOWNLOAD_DELAY apart.
+
+The enforcement half matters because Scrapy's own spacing is not sufficient
+under load: Slot._process_queue stamps lastseen when it schedules the download
+coroutine, not when the coroutine runs, and at high concurrency the event loop
+can be blocked in between. To prove the floor works independently, the second
+test configures a DOWNLOAD_DELAY *below* the floor and checks the gaps still
+come out above it.
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,9 +30,17 @@ from scrapy.crawler import CrawlerProcess  # noqa: E402
 
 from crawler.dispatch import DISPATCH_TIME, install  # noqa: E402
 
-DELAY = 2.0
 REQUESTS = 4
 TOLERANCE = 0.05
+
+# Scenario 1 measures Scrapy's own spacing: the floor is off, so the gaps can
+# only come from DOWNLOAD_DELAY.
+# Scenario 2 proves the floor stands on its own: DOWNLOAD_DELAY is set below
+# it, so any gap at or above the floor must come from dispatch.py.
+SCENARIOS = {
+    "measure": {"delay": 2.0, "floor": 0.0, "expect": 2.0},
+    "enforce": {"delay": 0.5, "floor": 2.0, "expect": 2.0},
+}
 
 observed: list[float] = []
 
@@ -45,7 +61,6 @@ class _Handler(BaseHTTPRequestHandler):
 class _Spider(Spider):
     name = "dispatch_probe"
     custom_settings = {
-        "DOWNLOAD_DELAY": DELAY,
         "DOWNLOAD_DELAY_JITTER": 0,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
         "CONCURRENT_REQUESTS": 16,
@@ -70,34 +85,56 @@ class _Spider(Spider):
         observed.append(float(response.meta[DISPATCH_TIME]))
 
 
-def main() -> int:
-    install()
+def run_scenario(name: str) -> int:
+    """Crawl once under one scenario and check the gaps. Runs in a subprocess.
+
+    A subprocess per scenario is needed because install() is idempotent by
+    design: the monkey-patch must not stack, so one process can only ever hold
+    one floor value.
+    """
+    cfg = SCENARIOS[name]
+    install(cfg["floor"])
 
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    process = CrawlerProcess(settings={"LOG_LEVEL": "ERROR"})
+    process = CrawlerProcess(settings={"LOG_LEVEL": "ERROR", "DOWNLOAD_DELAY": cfg["delay"]})
     process.crawl(_Spider, port=port)
     process.start()
     server.shutdown()
 
     observed.sort()
     if len(observed) != REQUESTS:
-        print(f"FAIL: expected {REQUESTS} dispatches, got {len(observed)}")
+        print(f"FAIL [{name}]: expected {REQUESTS} dispatches, got {len(observed)}")
         return 1
 
     gaps = [b - a for a, b in zip(observed, observed[1:], strict=False)]
-    print(f"delay setting : {DELAY}s")
-    print("gaps          : " + ", ".join(f"{g:.3f}s" for g in gaps))
+    expect = cfg["expect"]
+    print(
+        f"[{name}] delay={cfg['delay']}s floor={cfg['floor']}s "
+        f"gaps: {', '.join(f'{g:.3f}s' for g in gaps)}"
+    )
 
-    bad = [g for g in gaps if g < DELAY - TOLERANCE]
+    bad = [g for g in gaps if g < expect - TOLERANCE]
     if bad:
-        print(f"FAIL: {len(bad)} gap(s) under the configured delay")
+        print(f"FAIL [{name}]: {len(bad)} gap(s) under {expect}s")
         return 1
 
-    print("PASS: every dispatch gap respects the configured delay")
+    print(f"PASS [{name}]: every gap held at or above {expect}s")
     return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1:
+        return run_scenario(sys.argv[1])
+
+    # Parent: run each scenario in its own interpreter.
+    failures = 0
+    for name in SCENARIOS:
+        result = subprocess.run([sys.executable, __file__, name], check=False)
+        failures += result.returncode != 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

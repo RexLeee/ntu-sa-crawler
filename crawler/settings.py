@@ -32,9 +32,17 @@ CONCURRENT_REQUESTS = _crawl["concurrent_requests"]
 DOWNLOAD_TIMEOUT = _crawl["download_timeout"]
 DOWNLOAD_MAXSIZE = _crawl["download_maxsize"]
 DOWNLOAD_WARNSIZE = 0
-REACTOR_THREADPOOL_MAXSIZE = 50
+REACTOR_THREADPOOL_MAXSIZE = _crawl["reactor_threadpool_maxsize"]
 DNSCACHE_ENABLED = True
 DNSCACHE_SIZE = 200_000
+# CachingThreadedResolver runs lookups in the reactor thread pool and has no
+# negative cache, so at the 60s default one dead domain holds a thread for a
+# minute. A measured run lost 48% of the pool to 2,118 DNS failures.
+DNS_TIMEOUT = _crawl["dns_timeout"]
+
+# Response bodies queued for parsing. The 5 MB default is about 62 average
+# pages, which starts throttling the engine above roughly 60 pages/s.
+SCRAPER_SLOT_MAX_ACTIVE_SIZE = _crawl["scraper_slot_max_active_size"]
 
 # --- crawl order ------------------------------------------------------------
 # Positive DEPTH_PRIORITY with FIFO queues yields breadth-first order, which
@@ -68,6 +76,11 @@ FRONTIER_MAX_SIZE = _mem["frontier_max_size"]
 MEMUSAGE_ENABLED = True
 MEMUSAGE_LIMIT_MB = _mem["memusage_limit_mb"]
 MEMUSAGE_WARNING_MB = _mem["memusage_warning_mb"]
+
+# RobotsTxtMiddleware caches a parser per hostname and never evicts one. At
+# 8 KB each that dict alone reaches several GB in a broad crawl, which was the
+# main driver of memory growth. See crawler/middlewares/robots.py.
+ROBOTS_CACHE_SIZE = _mem["robots_cache_size"]
 
 # --- trimming ---------------------------------------------------------------
 COOKIES_ENABLED = _crawl["cookies_enabled"]

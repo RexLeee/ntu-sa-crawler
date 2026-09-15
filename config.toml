@@ -8,8 +8,28 @@ bot_name = "ntu-sa-crawler"
 user_agent = "ntu-sa-crawler/1.0 (NTU IM academic course project; contact: r14725023@ntu.edu.tw)"
 
 [politeness]
-# 0.2 qps per registered domain => 5.0s minimum gap between requests.
-download_delay = 5.0
+# 0.2 qps per registered domain is a 5.0s gap, but 5.0 exactly does not hold.
+#
+# Scrapy's Slot._process_queue sets slot.lastseen to the moment it SCHEDULES
+# the download coroutine, while the socket write happens whenever the event
+# loop gets round to running it. At high concurrency the loop is sometimes
+# busy: a measured run saw single pauses up to 1.4s. When the first request of
+# a pair is delayed and the second is not, the gap the SERVER sees is shorter
+# than 5.0s. That run produced 50 real violations, the worst at 4.694s, a
+# 306 ms shortfall.
+#
+# A 5.5s margin cut 50 violations to 1, but the jitter is a long tail
+# (p50 36ms, p99 302ms, max 559ms), so no margin closes it reliably.
+#
+# crawler/dispatch.py enforces required_min_gap at the last point before the
+# socket write instead, which is exact. This value only has to schedule near
+# the target; the floor below is what guarantees compliance.
+download_delay = 5.1
+# The hard floor. crawler/dispatch.py holds every slot to this gap measured
+# from real dispatch to real dispatch, and ops/verify_politeness.py checks
+# against it rather than download_delay, so tuning the schedule can never
+# relax the test.
+required_min_gap = 5.0
 # Scrapy randomizes delay to 0.5x-1.5x by default, which would produce 2.5s gaps.
 # Must stay 0 or we violate the rate limit.
 download_delay_jitter = 0.0
@@ -20,11 +40,29 @@ obey_robotstxt = true
 include_psl_private_domains = true
 
 [crawl]
-# The binding ceiling in testing, not bandwidth: pages/sec <= this / latency.
-# 20 measured 1.54 pages/s, 200 measured 3.09 at 511 MB peak memory.
-# Raise on the target machine while watching memory and the 429 rate.
-concurrent_requests = 200
+# Not "how many downloads run at once". Downloader.active counts a request
+# from the moment it is queued, including the up-to-5s wait on its domain
+# timer, so this is really the budget for "requests parked on a domain
+# timer" and therefore caps the number of domains in flight:
+#
+#     pages/sec <= distinct domains in active / download_delay
+#
+# At 200 a measured run held only ~57 distinct domains and managed
+# 3.82 pages/s. A parked request holds no socket and costs ~3 KB, so 3000
+# costs about 9 MB.
+concurrent_requests = 3000
 download_timeout = 10
+# Scrapy's default is 60s with no negative cache (see the TODO in
+# scrapy/resolver.py). Lookups run in the reactor thread pool, so one dead
+# domain holds a thread for a full minute. In the measured run 2,118 DNS
+# failures consumed 48% of the entire pool.
+dns_timeout = 5
+# DNS lookups all run here, so the pool size caps the new-domain rate.
+reactor_threadpool_maxsize = 200
+# Bytes of response body waiting to be parsed before the engine stops
+# dispatching. Scrapy defaults to 5 MB, which is ~62 average pages and starts
+# throttling above roughly 60 pages/s.
+scraper_slot_max_active_size = 104857600
 download_maxsize = 524288        # 512 KB; large pages rarely carry more links
 depth_priority = 1               # positive value + FIFO queues => breadth-first order
 log_level = "INFO"
@@ -37,7 +75,10 @@ redirect_max_times = 2
 # A single domain can yield at most 34560 pages in 48h anyway (1 per 5s).
 # Capping it frees frontier capacity for new domains, which is the real lever.
 max_crawled_per_domain = 5000
-max_queued_per_domain = 20000
+# Counts requests currently waiting in the frontier, and is released when each
+# one settles. It was previously never decremented, so a domain reaching this
+# number went silent for the rest of the run even for pages it never fetched.
+max_queued_per_domain = 5000
 # Priority bonus for the first URL of a previously unseen domain.
 new_domain_priority_bonus = 100
 
@@ -75,6 +116,12 @@ frontier_max_size = 2_000_000
 # Hard stop well under the 9.7 GB the WSL VM has.
 memusage_limit_mb = 7000
 memusage_warning_mb = 5500
+# Scrapy keeps every robots.txt parser it ever builds, keyed by hostname, and
+# never evicts. Measured: 0.9 KB for a one-rule file, 7.1 KB for a typical
+# one, 369 KB for a 500-rule one. That dict was the main driver of the
+# 5.3 GB RSS seen in an 87 minute run. Evicting only costs a re-fetch; the
+# robots check itself is never skipped.
+robots_cache_size = 50_000
 
 [paths]
 data_dir = "data"
@@ -82,6 +129,13 @@ state_dir = "state"
 # Without this the disk queue is inert and the whole frontier stays in RAM.
 jobdir = "state/job"
 
+[seeds]
+# The assignment allows 1000. Each one opens an independent 5 second pipeline,
+# so the count and the domain diversity both matter. Built by
+# seeds/build_seeds.py from Tranco and verified by seeds/probe.py.
+seeds_file = "seeds/seeds_1000.txt"
+
 [test]
+# 20 hand-picked URLs, used by the smoke run only.
 seeds_file = "tests/seeds_smoke.txt"
 timeout_seconds = 600

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import gzip
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -19,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from crawler.config import load_config  # noqa: E402
+from crawler.logwriter import read_lines  # noqa: E402
 from crawler.slot import slot_key  # noqa: E402
 
 # Clock jitter and log-write ordering can shave a few ms off a legitimate gap.
@@ -34,17 +34,16 @@ def load_events(paths: list[Path]) -> dict[str, list[float]]:
     """
     by_domain: dict[str, list[float]] = defaultdict(list)
     for path in paths:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            for lineno, line in enumerate(fh, 1):
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) < 3:
-                    continue
-                try:
-                    ts = float(parts[0])
-                except ValueError:
-                    print(f"{path}:{lineno}: bad timestamp, skipped", file=sys.stderr)
-                    continue
-                by_domain[slot_key(parts[2])].append(ts)
+        for lineno, line in enumerate(read_lines(path), 1):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                ts = float(parts[0])
+            except ValueError:
+                print(f"{path}:{lineno}: bad timestamp, skipped", file=sys.stderr)
+                continue
+            by_domain[slot_key(parts[2])].append(ts)
     return by_domain
 
 
@@ -55,7 +54,10 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config()
-    limit = cfg["politeness"]["download_delay"]
+    # Deliberately not download_delay. That setting carries a safety margin
+    # above the requirement, and reading it here would let a larger margin
+    # silently relax the test it is meant to pass.
+    limit = cfg["politeness"]["required_min_gap"]
 
     root = Path(__file__).resolve().parent.parent
     if args.logs:

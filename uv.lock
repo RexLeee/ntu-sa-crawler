@@ -1118,6 +1118,7 @@ name = "ntu-sa-crawler"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "protego" },
     { name = "rbloom" },
     { name = "scrapy" },
@@ -1127,6 +1128,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "protego", specifier = ">=0.3" },
     { name = "rbloom", specifier = ">=1.5.4" },
     { name = "scrapy", specifier = ">=2.12" },

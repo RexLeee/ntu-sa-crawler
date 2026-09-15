@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import argparse
 import glob
-import gzip
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from crawler.logwriter import read_lines  # noqa: E402
 from crawler.slot import slot_key  # noqa: E402
 
 HOURS_48 = 48 * 3600
@@ -27,6 +28,43 @@ def _paths(pattern: str, given: list[str]) -> list[Path]:
     if given:
         return [Path(p) for p in given if Path(p).exists()]
     return [Path(p) for p in sorted(glob.glob(str(root / "data" / pattern)))]
+
+
+def count_discovered(paths: list[Path]) -> tuple[int, int]:
+    """Return (total lines, distinct URLs) without holding them in memory.
+
+    A Python set costs about 42 bytes per URL, so the 127M URLs a 48 hour run
+    produces would need 5 GB and exhaust the machine. `sort -u` spills to disk
+    instead, which the WSL rootfs has ample room for.
+
+    Falls back to a set when sort is unavailable, since short runs fit easily.
+    """
+    if not paths:
+        return 0, 0
+
+    files = " ".join(f"'{p}'" for p in paths)
+    # LC_ALL=C compares bytes, which is both correct for URLs and much faster.
+    pipeline = f"zcat -f {files} | LC_ALL=C sort -u | wc -l"
+    try:
+        out = subprocess.run(
+            ["sh", "-c", pipeline], capture_output=True, text=True, check=True
+        )
+        unique = int(out.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        seen: set[str] = set()
+        for path in paths:
+            for line in read_lines(path):
+                url = line.rstrip("\n")
+                if url:
+                    seen.add(url)
+        return sum(1 for p in paths for line in read_lines(p) if line.strip()), len(seen)
+
+    total = 0
+    for path in paths:
+        for line in read_lines(path):
+            if line.strip():
+                total += 1
+    return total, unique
 
 
 def main() -> int:
@@ -51,43 +89,34 @@ def main() -> int:
     latencies: list[float] = []
 
     for path in crawled_paths:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            for line in fh:
-                p = line.rstrip("\n").split("\t")
-                if len(p) < 6:
-                    continue
-                sent, recv, url, status, _ctype, nlinks = p[0], p[1], p[2], p[3], p[4], p[5]
-                try:
-                    sent_f, recv_f = float(sent), float(recv)
-                except ValueError:
-                    continue
-                crawled += 1
-                first_ts = min(first_ts, sent_f)
-                last_ts = max(last_ts, recv_f)
-                latencies.append(recv_f - sent_f)
-                status_counts[status] += 1
-                if status.startswith("2"):
-                    ok_crawled += 1
-                try:
-                    total_links += int(nlinks)
-                except ValueError:
-                    pass
-                domains.add(slot_key(url))
+        for line in read_lines(path):
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 6:
+                continue
+            sent, recv, url, status, _ctype, nlinks = p[0], p[1], p[2], p[3], p[4], p[5]
+            try:
+                sent_f, recv_f = float(sent), float(recv)
+            except ValueError:
+                continue
+            crawled += 1
+            first_ts = min(first_ts, sent_f)
+            last_ts = max(last_ts, recv_f)
+            latencies.append(recv_f - sent_f)
+            status_counts[status] += 1
+            if status.startswith("2"):
+                ok_crawled += 1
+            try:
+                total_links += int(nlinks)
+            except ValueError:
+                pass
+            domains.add(slot_key(url))
 
-    unique_discovered = set()
-    discovered_lines = 0
-    for path in discovered_paths:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            for line in fh:
-                url = line.rstrip("\n")
-                if url:
-                    discovered_lines += 1
-                    unique_discovered.add(url)
+    discovered_lines, unique_count = count_discovered(discovered_paths)
 
     elapsed = max(last_ts - first_ts, 1e-6)
     pages_per_sec = crawled / elapsed
     links_per_page = total_links / crawled if crawled else 0.0
-    new_per_page = len(unique_discovered) / crawled if crawled else 0.0
+    new_per_page = unique_count / crawled if crawled else 0.0
     latencies.sort()
 
     print("=== measured ===")
@@ -95,7 +124,7 @@ def main() -> int:
     print(f"crawled (all)      : {crawled}")
     print(f"crawled (2xx)      : {ok_crawled}  ({100*ok_crawled/max(crawled,1):.1f}%)")
     print(f"discovered (raw)   : {discovered_lines}")
-    print(f"discovered (unique): {len(unique_discovered)}")
+    print(f"discovered (unique): {unique_count}")
     print(f"domains touched    : {len(domains)}")
     print(f"pages/sec          : {pages_per_sec:.2f}")
     print(f"links/page         : {links_per_page:.1f}")

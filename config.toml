@@ -65,7 +65,15 @@ reactor_threadpool_maxsize = 200
 scraper_slot_max_active_size = 104857600
 download_maxsize = 524288        # 512 KB; large pages rarely carry more links
 depth_priority = 1               # positive value + FIFO queues => breadth-first order
-log_level = "INFO"
+# INFO wrote 474 MB in 28 minutes, which extrapolates to ~48 GB over the full
+# run. Almost all of it is one line per fetch plus a stack trace per failure,
+# and neither is needed: data/crawled.log.gz already records every fetch, and
+# the failure counts come from the stats dump.
+log_level = "WARNING"
+# The telnet console is useful for inspecting a live crawl, but connecting to
+# it during a run injected AlreadyNegotiating errors into the log. Off unless
+# a specific investigation needs it.
+telnet_console = false
 retry_enabled = false
 cookies_enabled = false
 redirect_enabled = true

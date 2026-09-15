@@ -90,17 +90,25 @@ leaf_pid() {
     done
 } > "$RUNDIR/resources.tsv"
 
+# Copy before stopping. The logs are flushed as the crawl runs, so this
+# captures the run even if everything below goes wrong.
+collect
+
 # SIGTERM first so the dupefilter gets its chance to persist, then SIGKILL,
-# because graceful shutdown does not finish at this concurrency.
+# because graceful shutdown does not finish at this concurrency: it waits for
+# every parked request to time out, which took over five minutes in testing.
 echo "stopping     : $(date -Iseconds)"
 kill -TERM "$CRAWL_PID" 2>/dev/null || true
 for _ in $(seq 1 20); do
     kill -0 "$CRAWL_PID" 2>/dev/null || break
     sleep 1
 done
+# `uv run` is the parent; killing it alone leaves the python child running.
+pkill -9 -P "$CRAWL_PID" 2>/dev/null || true
 kill -9 "$CRAWL_PID" 2>/dev/null || true
 wait "$CRAWL_PID" 2>/dev/null || true
 
+# Again, to pick up whatever the crawl flushed during shutdown.
 collect
 echo "finished     : $(date -Iseconds)"
 echo "run dir      : $RUNDIR"

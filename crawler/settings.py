@@ -89,7 +89,7 @@ REDIRECT_ENABLED = _crawl["redirect_enabled"]
 REDIRECT_MAX_TIMES = _crawl["redirect_max_times"]
 AJAXCRAWL_ENABLED = False
 LOG_LEVEL = _crawl["log_level"]
-TELNETCONSOLE_ENABLED = True
+TELNETCONSOLE_ENABLED = _crawl["telnet_console"]
 
 DOWNLOADER_MIDDLEWARES = {
     # Must run before robots so the robots fetch inherits the right slot.

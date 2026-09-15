@@ -64,28 +64,46 @@ def _describe(name: str, ts: list[float], vs: list[float], unit: str) -> None:
     lin_k, lin_r2 = _fit_scale(ts, vs)
     sqrt_k, sqrt_r2 = _fit_scale([math.sqrt(t) for t in ts], vs)
 
-    better = "linear" if lin_r2 >= sqrt_r2 else "sqrt"
-    proj = lin_k * HOURS_48 if better == "linear" else sqrt_k * math.sqrt(HOURS_48)
-
-    print(f"\n{name}")
-    print(f"  final           : {vs[-1]:,.0f} {unit} at {ts[-1]:,.0f}s")
-    print(f"  linear fit R^2  : {lin_r2:.4f}")
-    print(f"  sqrt fit R^2    : {sqrt_r2:.4f}")
-    print(f"  better model    : {better}")
-    print(f"  48h projection  : {proj:,.0f} {unit}")
-
-    # Compare the first and last thirds. A decelerating curve is the one that
-    # survives 48 hours; a steady rate is the one that does not.
+    # Rates over the first and last thirds. These decide the verdict; the fits
+    # only describe the shape of whatever growth is left.
     third = len(ts) // 3
     early_span = ts[third] - ts[0]
     late_span = ts[-1] - ts[-third - 1]
+    early_rate = late_rate = None
     if early_span > 0 and late_span > 0:
         early_rate = (vs[third] - vs[0]) / early_span
         late_rate = (vs[-1] - vs[-third - 1]) / late_span
-        print(f"  rate first 1/3  : {early_rate:.3f} {unit}/s")
-        print(f"  rate last 1/3   : {late_rate:.3f} {unit}/s")
-        if early_rate > 0:
-            print(f"  deceleration    : {late_rate / early_rate:.2f}x")
+
+    print(f"\n{name}")
+    print(f"  peak            : {max(vs):,.0f} {unit}")
+    print(f"  final           : {vs[-1]:,.0f} {unit} at {ts[-1]:,.0f}s")
+    print(f"  linear fit R^2  : {lin_r2:.4f}")
+    print(f"  sqrt fit R^2    : {sqrt_r2:.4f}")
+
+    if early_rate is not None:
+        print(f"  rate first 1/3  : {early_rate:+.3f} {unit}/s")
+        print(f"  rate last 1/3   : {late_rate:+.3f} {unit}/s")
+
+    # A curve that has turned over is not a growth curve, and fitting a
+    # through-origin model to it produces a projection with no meaning. Say so
+    # rather than print a number the reader would trust.
+    if late_rate is not None and late_rate <= 0:
+        print("  verdict         : no longer growing; it peaked and is falling")
+        print("  48h projection  : not applicable to a curve that has turned over")
+        return
+
+    better = "linear" if lin_r2 >= sqrt_r2 else "sqrt"
+    proj = lin_k * HOURS_48 if better == "linear" else sqrt_k * math.sqrt(HOURS_48)
+    print(f"  better model    : {better}")
+
+    if max(lin_r2, sqrt_r2) < 0.5:
+        # Neither shape describes the data, so the extrapolation is noise.
+        print(f"  48h projection  : unreliable, best fit R^2 only {max(lin_r2, sqrt_r2):.2f}")
+    else:
+        print(f"  48h projection  : {proj:,.0f} {unit}")
+
+    if early_rate is not None and early_rate > 0:
+        print(f"  deceleration    : {late_rate / early_rate:.2f}x")
 
 
 def _domain_curve(crawled: Path, buckets: int = 40) -> tuple[list[float], list[float]]:
@@ -169,8 +187,9 @@ def main() -> int:
             # The politeness limit turns the domain count into a hard rate cap.
             print(f"  implied ceiling : {dvs[-1] / 5.0:,.1f} pages/s at 5s delay")
 
-    print("\nNote: a linear memory fit means the single-process design cannot")
-    print("run 48 hours. A sqrt fit means it can.")
+    print("\nRead the last-third rate first, not the fit. Linear growth that")
+    print("does not decelerate means the design cannot last 48 hours; a rate")
+    print("at or below zero means memory has found its working set.")
     return 0
 
 

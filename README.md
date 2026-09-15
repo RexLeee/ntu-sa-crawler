@@ -76,31 +76,30 @@ slot's delay timer releases a request. `crawler/dispatch.py` stamps
 `tests/test_dispatch.py` locks this in against a local HTTP server: four
 requests on one slot with a 2 second delay must dispatch 2 seconds apart.
 
-## Measured results (20 seeds)
+## Measured results
 
-| Metric | macOS, c=20 | macOS, c=200 | leepc, c=200 |
-|---|---|---|---|
-| Wall time | 302s | 536s | 660s |
-| Requests | 465 | 1,657 | 3,610 |
-| Domains touched | 442 | 1,442 | 3,081 |
-| Domains seen | — | — | 12,269 |
-| Unique discovered URLs | 25,297 | 81,481 | 175,903 |
-| Unique new URLs per page | 54.4 | 49.2 | 48.7 |
-| pages/sec | 1.54 | 3.09 | 5.53 |
-| Peak memory | 249 MB | 511 MB | 1,078 MB |
-| Politeness violations | **0** (4.999s) | **0** (4.996s) | **0** (4.990s) |
+| Metric | Before | After |
+|---|---|---|
+| Seeds | 20 | 1,000 |
+| CONCURRENT_REQUESTS | 200 | 3,000 |
+| Wall time | 5,241s | 573s |
+| Pages crawled | 20,000 | 26,801 |
+| **pages/sec** | **3.82** | **46.81** |
+| Unique discovered URLs | 2.1M raw | 690,788 unique |
+| Peak memory | 5,312 MB, still climbing | 980–1,056 MB, flat |
+| Download failures | 9,684 | 0 in 26,801 |
+| Politeness violations | **0** at the time | **0**, min gap 5.000s |
+| robots violations | not collected | **0** over 786 re-checked URLs |
 
-Compliance held unchanged at 10x concurrency and on a second machine, which is
-the property that matters: the limit is enforced per slot, so it does not
-degrade under load.
+The "before" column is an 87 minute run on leepc; "after" is 10 minutes on
+macOS, which is the slower machine. The rate difference is not machine speed.
 
-`unique new URLs per page` sits near 50 on every run and on both machines. It
-is the most stable number here, which makes it the right basis for projecting
-the discovered metric.
+Three ceilings were removed, and raising throughput exposed a fourth problem
+that had been invisible at 3.8 pages/s. Each is described below.
 
-All three runs are still ramping up. leepc had touched 3,081 domains but
-*seen* 12,269 when it stopped, so the frontier was nowhere near steady state
-and none of these rates can be extrapolated to 48 hours yet.
+`unique new URLs per page` was a stable ~50 across early runs and remains the
+right basis for projecting the discovered metric, though it falls as the crawl
+revisits known link targets: 49.5 at 3,000 pages, 25.8 at 26,801.
 
 ### A cross-domain redirect bypassed the rate limit
 
@@ -131,36 +130,163 @@ so `ops/run_hour.sh` simply raises the soft limit at startup.
 ## Throughput is bounded by domain count, not by the machine
 
 One domain yields at most one page per 5 seconds, so over 48 hours it can
-never exceed 34,560 pages. Three independent ceilings apply:
+never exceed 34,560 pages. The governing relation is:
 
 ```
-pages/sec <= active_domains / download_delay      (politeness)
-pages/sec <= CONCURRENT_REQUESTS / mean_latency   (in-flight budget)
-pages/sec <= bandwidth / mean_page_size           (network)
+pages/sec <= active_domains / download_delay
 ```
 
-The smoke runs are bound by the **second** ceiling, not by bandwidth. At 20
-concurrent requests and 0.29s latency the cap is about 4 pages/s regardless of
-how fast the link is; measured 1.54. Raising to 200 moved it to 3.09.
+An 87 minute run managed 3.82 pages/s, which implies only about 19 domains
+were ever in flight at once, against 18,344 discovered. Finding what held it
+there took reading Scrapy's source and measuring the local costs, because
+every plausible explanation was wrong:
 
-Neither run approached the bandwidth ceiling, so `CONCURRENT_REQUESTS` and the
-number of live domains are the levers that matter. Concurrency costs memory
-roughly linearly: 249 MB at 20, 511 MB at 200.
+| Suspected cause | Measured | Verdict |
+|---|---|---|
+| CPU parsing links | 0.91 ms/page, 1,096 pages/s on one core | not the limit |
+| Bandwidth | never approached | not the limit |
+| Frontier in memory | JOBDIR was already moving it to disk | not the limit |
 
-## Calibrating the 48 hour projection
+Three real ceilings were found, one of them introduced by our own code.
 
-`unique new URLs per page` is stable near 50 across both runs, so the
-discovered metric tracks crawled almost linearly:
+### 1. The frontier cap was O(number of domains)
 
+`CappedScheduler.enqueue_request` called `len(self)`. `Scheduler.__len__` sums
+`len()` over every per-domain queue, so its cost grows with the crawl:
+
+| Live domain queues | `len(self)` | Max enqueues/sec |
+|---|---|---|
+| 1,000 | 33 µs | 30,043 |
+| 10,000 | 333 µs | 3,001 |
+| 100,000 | 3,371 µs | 297 |
+
+One page yields ~49 requests, so 100 pages/s needs 4,900 enqueues/s. The run
+had reached 12,269 domains, which put this method's own ceiling near
+61 pages/s. It now tracks the size incrementally, which `tests/test_scheduler.py`
+locks in by asserting the cost stays flat as the domain count grows 10x.
+
+### 2. CONCURRENT_REQUESTS is a domain budget, not a download budget
+
+`scrapy/core/downloader/__init__.py` adds a request to `slot.active` when it is
+*queued*, before the delay wait:
+
+```python
+async def _enqueue_request(self, request):
+    key, slot = self._get_slot(request)
+    slot.active.add(request)          # counted from here
+    ...
+    slot.queue.append((request, d))   # then waits up to 5s
 ```
-discovered ≈ crawled × 50
+
+`needs_backout()` compares `CONCURRENT_REQUESTS` against that set, so the
+setting really caps how many requests may sit parked on domain timers, and
+therefore how many domains can be in flight. At 200 the run held about 57
+distinct domains.
+
+A parked request holds no socket and costs roughly 3 KB, so raising this is
+close to free: 3,000 costs about 9 MB.
+
+### 3. DNS failures consumed half the thread pool
+
+`CachingThreadedResolver` runs lookups in the reactor thread pool, and
+`scrapy/resolver.py` still carries a `# TODO: cache misses` where a negative
+cache would go. With the 60s default timeout, one dead domain holds a thread
+for a full minute.
+
+That run hit 2,118 DNS failures in 5,241s. Against a 50-thread pool
+(262,050 thread-seconds available) those failures alone claimed 127,080, or
+**48% of the entire pool**. `DNS_TIMEOUT` is now 5s and the pool is 200.
+
+### Memory was the robots cache, not the frontier
+
+`RobotsTxtMiddleware` keeps a parser per hostname in a plain dict and never
+evicts one. Measured sizes: 0.9 KB for a one-rule file, 7.1 KB for a typical
+one, 369 KB for a 500-rule one. At 500k hosts that dict alone reaches several
+GB, which matches the 5,312 MB the long run reached.
+
+It is now a bounded `LocalCache`. Eviction is safe because a miss re-fetches
+`robots.txt` and waits for it; the check is never skipped. `tests/test_robots_cache.py`
+asserts exactly that, along with the eviction not breaking in-flight fetches.
+
+## Raising throughput exposed a real politeness violation
+
+At 3.8 pages/s compliance was clean. At 40 pages/s the same code produced 50
+violations, the worst at 4.694s. This was not a measurement artifact.
+
+`Slot._process_queue` sets `slot.lastseen` when it *schedules* the download
+coroutine:
+
+```python
+now = monotonic()
+...
+while slot.queue and slot.free_transfer_slots() > 0:
+    slot.lastseen = now                                    # scheduled at T
+    _schedule_coro(self._wait_for_download(slot, request, queue_dfd))
 ```
 
-The crawled figure depends on the steady-state front size, which a 5–9 minute
-run cannot reach: the 200-concurrency run was still adding domains when it
-stopped (1,442 touched and climbing). Projections from these samples are
-therefore lower bounds, not estimates. A multi-hour run on the target machine
-is needed to fix the steady-state rate.
+The socket write happens when the event loop reaches that coroutine, at T+d.
+Scrapy spaces the schedule times by exactly 5s, so the gap the server sees is
+`5 + (d₂ - d₁)`. Under load the loop was blocked for up to 1.4s at a time, so
+d varied enough to push real gaps below the limit.
+
+Margin alone could not fix it. Raising `DOWNLOAD_DELAY` to 5.5s cut 50
+violations to 1, because the jitter is a long tail:
+
+| percentile | jitter |
+|---|---|
+| p50 | 36 ms |
+| p90 | 147 ms |
+| p99 | 302 ms |
+| max | 559 ms |
+
+`crawler/dispatch.py` now enforces the floor at the last point before the
+request goes out. Two details make it correct:
+
+- **Claim the turn before awaiting.** Coroutines released together would
+  otherwise read the same previous timestamp and wake at the same instant. The
+  first attempt did exactly that and left two of three gaps at 0.000s.
+- **Re-check the clock after every sleep, and advance from the real dispatch
+  time.** `asyncio.sleep` guarantees a lower bound, not an exact wake time, so
+  a single sleep still lands late by a varying amount.
+
+Result: 0 violations over 26,801 requests, minimum gap 5.000s.
+
+The general lesson is that a rate limit expressed as a scheduling delay is not
+a rate limit. It becomes one only when enforced against the clock at the point
+the request leaves.
+
+## Seed selection
+
+The assignment allows 1,000 seeds, and each one opens an independent 5 second
+pipeline, so seed count and domain diversity both feed directly into
+throughput.
+
+`seeds/build_seeds.py` draws from [Tranco](https://tranco-list.eu/), a research
+ranking that averages four commercial lists over 30 days to resist
+manipulation. Rank order alone is a poor seed list:
+
+1. **Infrastructure is dropped.** About 4% of the top 3,000 are names like
+   `gstatic.com` or `akamai.net` that serve no followable HTML.
+2. **One URL per registered domain.** Two hosts on one eTLD+1 share a timer and
+   buy no extra parallelism.
+3. **Sampled across TLDs.** The top 3,000 is 55% `.com`. A prefix would
+   concentrate the crawl in one slice of the web, so each TLD gets a quota
+   proportional to its share, capped at 35%.
+
+`seeds/probe.py` then fetches each candidate once and keeps only those
+returning HTML with at least 5 followable links. Of 3,000 candidates, 1,652
+were rejected:
+
+| Reason | Count |
+|---|---|
+| HTML but no usable links (JavaScript-rendered) | 733 |
+| DNS does not resolve | 446 |
+| Timeout | 173 |
+| Certificate error | 89 |
+| Redirect loop | 87 |
+
+The final list is 1,000 URLs across 291 TLDs, each verified reachable, with a
+mean of 115 links on the landing page.
 
 ## Design choices that follow from this
 

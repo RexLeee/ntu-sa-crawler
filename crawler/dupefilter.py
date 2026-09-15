@@ -19,12 +19,15 @@ sharply, so size for the end of the run rather than its current state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 
 from rbloom import Bloom
 from scrapy.dupefilters import BaseDupeFilter
 from scrapy.utils.job import job_dir
+from w3lib.url import canonicalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +70,52 @@ class BloomDupeFilter(BaseDupeFilter):
     def from_crawler(cls, crawler):
         # from_settings was removed in Scrapy 2.12; from_crawler is the only hook.
         settings = crawler.settings
-        return cls(
+        obj = cls(
             job_dir(settings),
             capacity=settings.getint("BLOOM_DUPEFILTER_CAPACITY", 50_000_000),
             error_rate=settings.getfloat("BLOOM_DUPEFILTER_ERROR_RATE", 1e-6),
             debug=settings.getbool("DUPEFILTER_DEBUG"),
             fingerprinter=crawler.request_fingerprinter,
         )
+        # The spider checks URLs against this filter before it builds a
+        # Request, so it needs a handle on the same instance.
+        crawler.bloom_dupefilter = obj
+        return obj
 
     def request_seen(self, request) -> bool:
         fp = self.fingerprinter.fingerprint(request)
+        if fp in self.bloom:
+            return True
+        self.bloom.add(fp)
+        return False
+
+    def url_seen(self, url: str) -> bool:
+        """Test and record a URL without building a Request first.
+
+        Three quarters of the requests a broad crawl yields are duplicates: a
+        measured 28 minutes produced 3,319,826 filtered against 1,106,885
+        scheduled. Reaching request_seen means each of those has already been
+        allocated as a Request, carried through the spider middleware chain
+        and handed to the engine, only to be dropped.
+
+        The fingerprint must match request_fingerprint exactly, or the
+        scheduler would filter a second time on a different value and the
+        saving would be lost. That function hashes
+        sha1(json({method, url, body, headers})) with sorted keys, and for our
+        requests method is GET with an empty body and no included headers, so
+        only the canonical URL varies. tests/test_dupefilter.py holds the two
+        implementations against each other on real URLs.
+        """
+        payload = json.dumps(
+            {
+                "method": "GET",
+                "url": canonicalize_url(url),
+                "body": "",
+                "headers": {},
+            },
+            sort_keys=True,
+        )
+        fp = hashlib.sha1(payload.encode(), usedforsecurity=False).digest()
         if fp in self.bloom:
             return True
         self.bloom.add(fp)

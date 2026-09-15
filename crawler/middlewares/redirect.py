@@ -26,4 +26,9 @@ class SlotAwareRedirectMiddleware(RedirectMiddleware):
         )
         # Re-key on the destination, not the source.
         redirect_request.meta["download_slot"] = slot_key(redirect_request.url)
+        # The spider now sets dont_filter on requests it has already checked
+        # against the Bloom filter, and replace() copies that flag. A redirect
+        # target is a different URL that nothing has checked, so restore
+        # filtering or a redirect loop between two URLs would never terminate.
+        redirect_request.dont_filter = False
         return redirect_request

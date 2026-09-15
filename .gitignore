@@ -12,7 +12,13 @@ __pycache__/
 # Crawl output: regenerated on every run, and large
 data/*.log.gz
 data/*.jsonl
+data/runstats.tsv
 *.log
+
+# Per-run directories created by ops/run_hour.sh. The evidence a run produced
+# is reported from these, not read out of git.
+data/run-*/
+data/profile*.svg
 
 # Scrapy resume state (JOBDIR)
 state/*

@@ -65,6 +65,8 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         # grow for the whole 48 hours.
         self._pending_delays = LocalCache(limit=cache_size)
         crawler.signals.connect(self._on_robots_parsed, signal=signals.robots_parsed)
+        # The runstats extension reports cache occupancy and in-flight count.
+        crawler.robots_middleware = self
 
     async def robot_parser(self, request: Request):
         """Fetch and cache robots.txt, keeping the fetch on our domain slot.
@@ -108,7 +110,11 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
             await self._parse_robots(resp, netloc, request)
         except Exception as e:
             if not isinstance(e, IgnoreRequest):
-                logger.warning("robots.txt fetch failed for %s: %s", netloc, e)
+                # DEBUG, not WARNING. A broad crawl reaches dead hosts
+                # constantly: 17,742 of these in a 28 minute run. Every one is
+                # already counted in robotstxt/exception_count/*, which is the
+                # form the report needs.
+                logger.debug("robots.txt fetch failed for %s: %s", netloc, e)
             self._robots_error(e, netloc)
         finally:
             # _parse_robots and _robots_error read this entry to fire the

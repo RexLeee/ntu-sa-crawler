@@ -91,6 +91,20 @@ AJAXCRAWL_ENABLED = False
 LOG_LEVEL = _crawl["log_level"]
 TELNETCONSOLE_ENABLED = _crawl["telnet_console"]
 
+# Scrapy logs every download failure at ERROR with a traceback, which
+# LOG_LEVEL=WARNING does not suppress. A broad crawl fails constantly: 94,658
+# such records filled a 495 MB log in 28 minutes. The counts survive in the
+# stats dump.
+LOG_FORMATTER = "crawler.logformatter.QuietLogFormatter"
+
+# --- measurement -------------------------------------------------------------
+# The external sampler sees RSS and file descriptors. It cannot see main-thread
+# CPU, reactor lag, the scraper queue or the per-domain queue count, which are
+# the numbers that decide whether this survives 48 hours.
+EXTENSIONS = {"crawler.extensions.runstats.RunStats": 500}
+RUNSTATS_INTERVAL = _crawl["runstats_interval"]
+RUNSTATS_OBJECTS_INTERVAL = _crawl["runstats_objects_interval"]
+
 DOWNLOADER_MIDDLEWARES = {
     # Must run before robots so the robots fetch inherits the right slot.
     "crawler.middlewares.slot.SlotKeyMiddleware": 90,

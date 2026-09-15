@@ -62,14 +62,36 @@ reactor_threadpool_maxsize = 200
 # Bytes of response body waiting to be parsed before the engine stops
 # dispatching. Scrapy defaults to 5 MB, which is ~62 average pages and starts
 # throttling above roughly 60 pages/s.
-scraper_slot_max_active_size = 104857600
+#
+# 100 MB was too generous. A measured run took 13.65s at the median from
+# dispatch to parse, against a 10s download timeout, because responses sat in
+# this queue. A deep queue only adds latency and memory; it never adds
+# throughput, since the parser is the thing that is behind.
+scraper_slot_max_active_size = 33554432   # 32 MB
 download_maxsize = 524288        # 512 KB; large pages rarely carry more links
-depth_priority = 1               # positive value + FIFO queues => breadth-first order
+# 0, not 1. DownloaderAwarePriorityQueue picks the next slot purely by active
+# download count and never reads request priority, so DEPTH_PRIORITY cannot
+# affect the order domains are visited in. Within one domain a FIFO queue is
+# already breadth-first. All a positive value did was split each domain's
+# queue across several priority buckets: 3,430 domains produced 7,569 queue
+# directories and 15,422 open file descriptors, two per queue.
+depth_priority = 0
 # INFO wrote 474 MB in 28 minutes, which extrapolates to ~48 GB over the full
 # run. Almost all of it is one line per fetch plus a stack trace per failure,
 # and neither is needed: data/crawled.log.gz already records every fetch, and
 # the failure counts come from the stats dump.
+#
+# WARNING alone was not enough. Scrapy logs every download failure at ERROR
+# with a full traceback, and a broad crawl fails constantly: 94,658 ERROR
+# records inside a 495 MB log. crawler/logformatter.py demotes those to DEBUG.
 log_level = "WARNING"
+# How often crawler/extensions/runstats.py samples the internals that decide
+# whether this design survives 48 hours: main-thread CPU, reactor lag, the
+# scraper queue, and the per-domain queue count that pop() cost scales with.
+runstats_interval = 30
+# Type histogram of live objects. RSS alone cannot separate a real working set
+# from allocator fragmentation; flat counts against rising RSS mean the latter.
+runstats_objects_interval = 600
 # The telnet console is useful for inspecting a live crawl, but connecting to
 # it during a run injected AlreadyNegotiating errors into the log. Off unless
 # a specific investigation needs it.
@@ -86,9 +108,12 @@ max_crawled_per_domain = 5000
 # Counts requests currently waiting in the frontier, and is released when each
 # one settles. It was previously never decremented, so a domain reaching this
 # number went silent for the rest of the run even for pages it never fetched.
-max_queued_per_domain = 5000
-# Priority bonus for the first URL of a previously unseen domain.
-new_domain_priority_bonus = 100
+#
+# 500, not 5000. One domain drains at 0.2 qps, so 500 queued pages is already
+# 42 minutes of work for it. Anything beyond that is frontier capacity and
+# disk held for a domain that cannot use it, taken from domains we have not
+# discovered yet.
+max_queued_per_domain = 500
 
 [filters]
 max_url_length = 2048
@@ -120,7 +145,14 @@ bloom_capacity = 50_000_000
 bloom_error_rate = 1e-6
 # Nothing in Scrapy caps the queue, so this is enforced by a scheduler
 # subclass. Dropped URLs are not marked as seen and can return later.
-frontier_max_size = 2_000_000
+#
+# Raised from 2M. The frontier lives on disk under JOBDIR, so the cost is not
+# memory: a measured run held 930k requests in 610 MB, about 660 bytes each,
+# and the disk has 950 GB free. At 2M the cap was reached in roughly an hour,
+# and after that every new URL was dropped, including the first URL of an
+# unseen domain. That is the one thing we cannot afford to drop, so
+# CappedScheduler now exempts it as well.
+frontier_max_size = 20_000_000
 # Hard stop well under the 9.7 GB the WSL VM has.
 memusage_limit_mb = 7000
 memusage_warning_mb = 5500

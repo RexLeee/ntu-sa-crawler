@@ -45,7 +45,15 @@ class CappedScheduler(Scheduler):
         obj._cap = crawler.settings.getint("FRONTIER_MAX_SIZE", 500_000)
         obj._size = 0
         obj._warned = False
+        # The runstats extension reads _size and the per-domain queue count
+        # from here rather than reaching into engine internals.
+        crawler.capped_scheduler = obj
         return obj
+
+    def has_pending_requests(self) -> bool:
+        # The parent computes len(self) > 0, which sums over every per-domain
+        # queue. It runs on every idle check, so use the tracked size.
+        return self._size > 0
 
     def open(self, spider):
         result = super().open(spider)
@@ -55,7 +63,12 @@ class CappedScheduler(Scheduler):
         return result
 
     def enqueue_request(self, request) -> bool:
-        if self._size >= self._cap:
+        # Throughput is capped at active_domains / delay, so the first URL of
+        # an unseen domain is worth more than any number of extra pages on a
+        # domain already held. Dropping it because the frontier is full would
+        # freeze domain growth, which is the one curve that sets the ceiling.
+        # A measured run filled a 2M frontier in about an hour.
+        if self._size >= self._cap and not request.meta.get("new_domain"):
             if not self._warned:
                 logger.info(
                     "frontier reached %d requests; dropping new ones until it drains",

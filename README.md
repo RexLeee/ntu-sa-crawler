@@ -97,6 +97,25 @@ macOS, which is the slower machine. The rate difference is not machine speed.
 Three ceilings were removed, and raising throughput exposed a fourth problem
 that had been invisible at 3.8 pages/s. Each is described below.
 
+> **The "0 download failures" figure above does not survive at full speed.**
+> It comes from the 10 minute macOS run, which was too slow to reach the
+> state where failures appear. A 28 minute run on leepc at 35 pages/s
+> reported this instead:
+>
+> | | |
+> |---|---|
+> | Requests issued | 221,897 |
+> | Responses received | 83,341 |
+> | Exceptions | **140,331 (63%)** |
+> | of which download timeouts | 132,878 |
+> | robots.txt fetches | 45,825 |
+> | of which timed out | **40,957 (89%)** |
+>
+> A robots.txt fetch that times out is treated as permission granted, so at
+> that rate most domains were crawled without their rules ever being read.
+> That is a compliance risk, not only a throughput one. See
+> "The reactor thread is the fourth ceiling" below.
+
 `unique new URLs per page` was a stable ~50 across early runs and remains the
 right basis for projecting the discovered metric, though it falls as the crawl
 revisits known link targets: 49.5 at 3,000 pages, 25.8 at 26,801.
@@ -207,6 +226,62 @@ GB, which matches the 5,312 MB the long run reached.
 It is now a bounded `LocalCache`. Eviction is safe because a miss re-fetches
 `robots.txt` and waits for it; the check is never skipped. `tests/test_robots_cache.py`
 asserts exactly that, along with the eviction not breaking in-flight fetches.
+
+### The reactor thread is the fourth ceiling
+
+Removing the first three raised the rate to 35 pages/s and produced a 63%
+exception rate. The cause is not the network. Both plausible network
+explanations were measured and ruled out on the machine that runs the crawl:
+
+| Test | Result |
+|---|---|
+| WSL DNS forwarder, 400 names at 100 concurrent | p50 88 ms, p99 600 ms, 0 failures |
+| WSL NAT, 300 real hosts at 300 concurrent `curl` | 2 hard timeouts out of 300 |
+
+The evidence points at CPU instead. Successful pages took a median of 13.65 s
+from dispatch to `parse()`, against a 10 s download timeout. Time that a
+download cannot have spent must have been spent queued for parsing, and the
+scraper queue held 100 MB, roughly 770 responses, which at 45 pages/s is the
+17 s that matches the p90 of 17.86 s.
+
+Scrapy parses on the reactor thread, alongside every TLS handshake, socket
+read and timer. When parsing saturates that thread, a completed `connect()`
+is not serviced and the 10 s timer fires on a host that is in fact answering.
+The signature is in the data: 5,111 timeouts landed on 1,091 hosts that also
+returned pages in the same run, and the log shows 73,275 connect-stage
+timeouts distinct from the download-stage ones.
+
+The machine has 8 cores and the crawl uses one. `crawler/extensions/runstats.py`
+now samples main-thread CPU and reactor lag directly, so the next run
+confirms or refutes this rather than inferring it.
+
+Three quarters of the work on that thread was avoidable. A measured run
+filtered 3,319,826 duplicate requests against 1,106,885 scheduled, and each
+duplicate was allocated as a `Request`, carried through the spider middleware
+chain and handed to the engine before being dropped. The spider now tests the
+URL against the Bloom filter before building anything, using a fingerprint
+proven identical to Scrapy's in `tests/test_dupefilter.py`.
+
+### pop() is O(domains in the frontier)
+
+`DownloaderAwarePriorityQueue.pop()` builds a list over every per-domain queue
+and then scans it. Reproduced on the same `_next_slot` logic:
+
+| Domains in frontier | One pop | Cost at 100 pops/s |
+|---|---|---|
+| 3,430 (28 min) | 0.24 ms | 2% of a core |
+| 10,000 | 0.86 ms | 9% |
+| 35,000 (48 h, projected) | 2.94 ms | **29%** |
+| 100,000 | 8.47 ms | **85%** |
+
+This is invisible in a short run and unavoidable in a long one. It is the
+reason a 28 minute sample cannot be extrapolated to 48 hours on rate alone.
+
+`DEPTH_PRIORITY` was also removed here. `_next_slot` chooses purely by active
+download count and never reads request priority, so it could not affect which
+domain was visited next. Its only measurable effect was splitting each
+domain's queue across priority buckets: 3,430 domains produced 7,569 queue
+directories and 15,422 open descriptors, two per queue.
 
 ## Raising throughput exposed a real politeness violation
 

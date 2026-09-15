@@ -12,10 +12,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
 
-# The soft limit is 1024. A measured run peaked at 2,021 open descriptors,
-# most of them robots.txt fetches and DNS sockets rather than page transfers.
-# The hard limit is 1048576, so this needs no root and no config file.
-ulimit -n 65536
+# The soft limit is 1024. Each (domain, priority) pair in the frontier is a
+# FifoDiskQueue holding two open files, head and tail, so descriptors track
+# the frontier's shape rather than the number of live connections: a measured
+# run reached 7,569 queues and 15,422 descriptors. The hard limit is
+# 1,048,576, so raising this needs no root and no config file.
+ulimit -n 1000000
+
+# glibc raises its mmap threshold dynamically as a program frees large blocks,
+# after which page bodies of a few hundred KB are served from the heap and
+# fragment it instead of being returned to the OS. Pinning the threshold and
+# capping arenas keeps RSS closer to the live set. data/objects.log shows
+# whether it worked: flat object counts against rising RSS mean fragmentation.
+export MALLOC_ARENA_MAX=2
+export MALLOC_MMAP_THRESHOLD_=131072
 
 DURATION="${1:-3600}"
 SEEDS="${2:-seeds/seeds_1000.txt}"
@@ -25,7 +35,7 @@ RUNDIR="data/run-${STAMP}"
 mkdir -p "$RUNDIR"
 
 # Start clean so the metrics describe this run alone.
-rm -f data/crawled.log.gz data/discovered.log.gz
+rm -f data/crawled.log.gz data/discovered.log.gz data/runstats.tsv data/objects.log
 rm -rf state/job
 
 echo "run dir      : $RUNDIR"
@@ -48,6 +58,7 @@ echo "pid          : $CRAWL_PID"
 # because this only ran on the clean-exit path.
 collect() {
     cp data/crawled.log.gz data/discovered.log.gz "$RUNDIR/" 2>/dev/null || true
+    cp data/runstats.tsv data/objects.log "$RUNDIR/" 2>/dev/null || true
 }
 trap collect EXIT INT TERM
 

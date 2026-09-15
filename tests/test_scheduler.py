@@ -92,6 +92,70 @@ def test_cap_is_enforced() -> bool:
     return True
 
 
+def test_new_domain_bypasses_cap() -> bool:
+    """A full frontier must still admit the first URL of an unseen domain.
+
+    Throughput is bounded by active_domains / delay, so dropping these would
+    freeze the one curve that sets the ceiling. A measured run filled a 2M
+    frontier in about an hour and then dropped everything, new domains
+    included.
+    """
+    sched = _scheduler(cap=10)
+    for i in range(10):
+        sched.enqueue_request(
+            Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"})
+        )
+
+    ordinary = sched.enqueue_request(
+        Request("https://d0.example/more", meta={"download_slot": "d0"})
+    )
+    if ordinary:
+        print("FAIL: a full frontier accepted an ordinary request")
+        return False
+
+    new_domain = sched.enqueue_request(
+        Request(
+            "https://fresh.example/",
+            meta={"download_slot": "fresh", "new_domain": True},
+        )
+    )
+    if not new_domain:
+        print("FAIL: a full frontier rejected a new domain")
+        return False
+
+    if sched._size != len(sched):
+        print(f"FAIL: exempt request broke size tracking: {sched._size} != {len(sched)}")
+        return False
+
+    print("PASS: new domains bypass the cap, size tracking intact")
+    return True
+
+
+def test_has_pending_requests_is_o1() -> bool:
+    """has_pending_requests must not sum over every per-domain queue."""
+    sched = _scheduler(cap=10_000_000)
+    if sched.has_pending_requests():
+        print("FAIL: empty scheduler reports pending requests")
+        return False
+
+    for i in range(500):
+        sched.enqueue_request(
+            Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"})
+        )
+    if not sched.has_pending_requests():
+        print("FAIL: populated scheduler reports no pending requests")
+        return False
+
+    while sched.next_request() is not None:
+        pass
+    if sched.has_pending_requests():
+        print("FAIL: drained scheduler still reports pending requests")
+        return False
+
+    print("PASS: has_pending_requests tracks the counter, not the queues")
+    return True
+
+
 def test_enqueue_cost_is_flat() -> bool:
     """Enqueue must not slow down as the domain count grows."""
     timings = {}
@@ -125,6 +189,8 @@ def main() -> int:
     results = [
         test_size_matches_real_length(),
         test_cap_is_enforced(),
+        test_new_domain_bypasses_cap(),
+        test_has_pending_requests_is_o1(),
         test_enqueue_cost_is_flat(),
     ]
     return 0 if all(results) else 1

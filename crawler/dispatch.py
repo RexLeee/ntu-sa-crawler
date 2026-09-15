@@ -113,11 +113,22 @@ def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
     # Diagnostics. last_dispatch records what actually went out per slot, which
     # is what the compliance check measures; next_allowed records what was
     # promised. A short gap means those two disagree, and the dump says how.
+    # Keyed by domain, so it grows with the domain count rather than the
+    # request count: a 48 hour run reaching 37,000 domains holds about 10 MB
+    # of URL strings here. Bounded anyway, since the trace is a diagnostic and
+    # must not be the thing that runs the crawl out of memory.
     trace_fh = _open_trace(trace_path) if trace_path else None
     last_dispatch: dict[str, tuple[float, str, float]] = {}
+    _LAST_DISPATCH_MAX = 200_000
 
     def _trace_short_gap(downloader, slot, request, slot_id, claimed_turn, dispatched):
         previous = last_dispatch.get(slot_id)
+        if previous is None and len(last_dispatch) >= _LAST_DISPATCH_MAX:
+            # Drop the whole history rather than pay to find the oldest entry.
+            # Losing it only means the next dispatch on each domain has nothing
+            # to compare against, so one gap goes unchecked per domain. The
+            # real compliance check reads crawled.log.gz and is unaffected.
+            last_dispatch.clear()
         last_dispatch[slot_id] = (dispatched, request.url, claimed_turn)
         if previous is None:
             return

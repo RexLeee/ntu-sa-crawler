@@ -15,16 +15,26 @@ uv sync
 # 5 minute smoke run against tests/seeds_smoke.txt
 uv run scrapy crawl broad -s CLOSESPIDER_TIMEOUT=300
 
-# compliance proofs
+# a real run: sharding.shards processes, resources sampled throughout
+ops/run_hour.sh 600
+
+# compliance proofs, across every shard's log
 uv run python ops/verify_politeness.py     # must print "VIOLATIONS : 0"
 uv run python ops/verify_robots.py         # must print "VIOLATIONS : 0"
+uv run python ops/verify_no_refetch.py     # ~1.4%, see the redirect note
 
 # measured metrics and projection
 uv run python ops/report_metrics.py
 
-# regression test for the dispatch timer
-uv run python tests/test_dispatch.py
+# tests
+for t in dispatch handoff pqueue scheduler robots_cache dupefilter; do
+    uv run python tests/test_$t.py
+done
 ```
+
+`data/violation-trace*.log` must stay empty. The dispatch timer and
+`verify_politeness.py` group by the same key, so anything written there is a
+real short gap.
 
 All tunable values live in `config.toml`. No parameter is hardcoded in the
 Python sources.
@@ -482,6 +492,84 @@ The general lesson is that a rate limit expressed as a scheduling delay is not
 a rate limit. It becomes one only when enforced against the clock at the point
 the request leaves.
 
+## Sharding: more cores without shared state
+
+After the `pop()` fix the reactor thread was still at 99%, but the profile no
+longer showed anything wasteful. `parse` and `_extract_links` together were
+42%, and that is the work the crawl exists to do. Scrapy runs all of it on one
+thread, so the only remaining lever is more processes.
+
+### Why the partition is by domain
+
+`crawler/slot.shard_of()` assigns each registered domain to exactly one
+process. That single rule is what makes the whole thing safe: a domain's 5
+second timer lives inside one process, so no shared clock, no lock and no
+coordination is needed to enforce it. Two processes crawling one domain would
+each hold their own timer and silently double the real rate against that site,
+and nothing in either process could detect it.
+
+The rule only holds if every path that can produce a request respects it:
+
+| path | how it is bound to the owner |
+|---|---|
+| seeds | every process reads the seed file and keeps only its own |
+| page links | `_maybe_follow` checks the owner before admitting |
+| redirects | target checked in `SlotAwareRedirectMiddleware`, handed over |
+| robots.txt | same registered domain as the page, so the same shard |
+| meta refresh | off |
+
+Redirects are the interesting case. Seeds and links are checked before a
+request exists, but a redirect picks its destination after the fetch, so it is
+the one path that can move a request onto a domain this process does not own.
+
+The hash covers the whole key rather than its first 8 bytes. Domains share
+prefixes heavily, so truncating skews the split: measured over 5,994 domains,
+2.012x max/min at 8 shards against 1.124x for the full digest. Over the 2,229
+domains a 10 minute run actually reached, the full digest gives 1.077x at 4
+shards.
+
+### Cross-shard URLs have to be handed over, not dropped
+
+The obvious implementation drops a URL another shard owns. That is wrong, and
+the reason is the throughput bound:
+
+```
+pages/sec <= active domains / delay
+```
+
+A broad crawl finds nearly every new domain through a cross-domain link, so a
+process that drops them keeps only the domains its own seeds reached. N
+processes would then crawl little more than one. The links have to reach
+whoever owns them.
+
+`crawler/handoff.py` is an append-only text file per (sender, recipient) pair.
+That is enough because of what the traffic is: one-directional, unordered, and
+survivable to lose, since a dropped URL is almost certainly linked from
+another page too. Delivery guarantees would cost more than the thing they
+protect.
+
+Ordering is what removes the need for locking. Each sender appends to its own
+file, so there is exactly one writer per file. Readers track a byte offset and
+stop before any line that has no newline yet, so a reader arriving mid-write
+sees the line on its next poll rather than half a URL.
+
+Received URLs go through the same `_admit()` as local links, so they face the
+same Bloom filter and the same per-domain limits. They are deliberately not
+counted into `discovered_raw` again: the shard that found the link already
+counted it, and recounting would inflate the Tier 1 metric once per process
+boundary crossed.
+
+### The shard count is set by memory, not by cores
+
+The machine has 8 cores, but WSL2 is given 9.9 GB and one process measured
+1,468 MB at 10 minutes. Every value in `[memory]` is therefore per process and
+documented as such, sized for one shard's share of the work rather than the
+whole crawl's.
+
+Four shards at `bloom_capacity = 15M` cost 205 MB in total against 171 MB for
+a single process at 50M. That extra 34 MB is what sharding trades for the
+ability to use more than one core, and it is the right trade.
+
 ## Seed selection
 
 The assignment allows 1,000 seeds, and each one opens an independent 5 second
@@ -541,6 +629,7 @@ crawler/extract.py                regex href extraction
 crawler/filters.py                canonicalization and trap filtering
 crawler/logwriter.py              gzipped TSV writers
 crawler/downloader.py             keys every slot by eTLD+1 of the URL
+crawler/handoff.py                passes URLs between sharded processes
 crawler/pqueue.py                 O(1) next-domain selection
 crawler/scheduler.py              frontier cap with O(1) size tracking
 crawler/dupefilter.py             Bloom duplicate filter

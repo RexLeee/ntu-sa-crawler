@@ -148,20 +148,33 @@ follow_meta_refresh = false
 # processes and needs no shared state. That is the whole reason sharding is
 # safe here.
 #
-# 1, because measurement said so. Four shards reached 52.29 pages/s against
-# 54.54 for a single process, while issuing 1.7x the requests to get the same
-# number of responses back. The established TCP count and the DNS cache are
-# the same either way: the limit is the network, not the CPU, and more
-# processes only add requests that time out. See the README.
+# 2, because the bottleneck moved. The earlier answer here was 1: four shards
+# reached 52.29 pages/s against 54.54 for a single process, and the conclusion
+# drawn was "the limit is the network, not the CPU". That measurement was
+# taken on the WSL host, whose Wi-Fi link the crawl had already saturated to
+# 72%. Four processes were contending for a link that was already full.
+#
+# On t2d-standard-2 the link is not the constraint. Measured: 12.0 Mbps used
+# against 1,570 Mbps available, 0.8%. The condition the note below states,
+# "it will only help if the link stops being the bottleneck", now holds.
+#
+# The reactor is the constraint instead, and the evidence is three-fold:
+# proc_cpu_pct 100.5% where two dedicated cores would allow 200%, main_cpu_pct
+# 99.5% inside that, and reactor lag at a 2,631 ms median against the 5.0s
+# per-domain gap the timer has to hit.
+#
+# Domain supply is not the constraint either, which is the measurement that
+# rules out the remaining explanation. pages/sec <= dl_slots / download_delay,
+# and dl_slots reached 8,783 by the end of a ten minute run: a ceiling of
+# 1,757 pages/s against the 25.52 actually achieved, 1.5% of it. The domains
+# were there and the reactor could not dispatch them.
 #
 # Raising this is safe for compliance at any value, since each domain belongs
-# to exactly one process, and the machinery is kept for that reason. It will
-# only help if the link stops being the bottleneck.
+# to exactly one process. Verified at 0 violations across four processes.
 #
-# Above 1, every limit in [memory] is per process, so size them for one
-# shard's share and watch total RSS against the 7.9 GB the t2d-standard-2 has.
-# Four shards measured 4.0 GB together.
-shards = 1
+# Every limit in [memory] is per process, so they are sized for one shard's
+# share and total RSS is what has to clear the 7.9 GB this machine has.
+shards = 2
 # How often each process drains the URLs other shards handed it. The poll is a
 # few file reads, and a URL waiting here is a domain not yet being crawled, so
 # this is short.
@@ -231,18 +244,28 @@ frontier_max_size = 20_000_000
 # process before Scrapy's MemoryUsage extension noticed, losing the log flush
 # and the persisted dupefilter.
 #
+# PER PROCESS, which is what sizes it: at shards = 2 the machine holds two of
+# these, so the number that has to clear 7.9 GB is twice what is written here.
+# 6000 was right for one process and became unsafe the moment the second one
+# started, because 12000 is above physical RAM and the guard would never fire.
+#
 # Sized against a measured slope, not a peak. A ten minute run on t2d peaked
-# at 1,983 MB, so 2800 left almost no margin: extrapolating the ramp-up slope
-# of 2.48 MB/s put the cap 26 minutes out. The slope halves as the run settles,
-# to 1.25 MB/s over the last 200s, because robots_cache_size and dns_cache_size
-# are both finite and stop growing once full. It has not been measured past ten
-# minutes, so the 48 hour shape is still unknown and 6000 is deliberately
-# generous: hitting the cap ends the crawl, which costs more than the RAM does.
-# 6000 leaves ~1.9 GB for the kernel, the page cache and the JOBDIR write path.
-memusage_limit_mb = 6000
-# 1000 MB of runway below the limit. At the settled 1.25 MB/s that is about
-# thirteen minutes of warning in runstats before the hard stop.
-memusage_warning_mb = 5000
+# at 1,983 MB for a single process. Where it settles is set by the two caches
+# that grow: robots_cache_size and dns_cache_size are both finite and stop
+# contributing once full. The robots cache is the larger by far. objects.log
+# recorded 1,161,143 protego _Rule objects against 22,485 cached hosts, which
+# is 51.6 rules per host, and protego measures 0.234 KB per rule. Growing that
+# cache from 22,485 to its 50,000 ceiling therefore adds about 325 MB, putting
+# a settled process near 2,300 MB.
+#
+# 3000 x 2 = 6000 MB, leaving ~1.9 GB for the kernel, the page cache and the
+# JOBDIR write path, and ~700 MB of headroom per process above the projection.
+# It has not been measured past ten minutes, so the 48 hour shape is still
+# unknown: hitting the cap ends that shard, which costs more than the RAM does.
+memusage_limit_mb = 3000
+# 500 MB of runway below the limit, which lands in runstats well before the
+# hard stop at the slope this settles to.
+memusage_warning_mb = 2500
 # Scrapy keeps every robots.txt parser it ever builds, keyed by hostname, and
 # never evicts. Measured: 0.9 KB for a one-rule file, 7.1 KB for a typical
 # one, 369 KB for a 500-rule one. That dict was the main driver of the

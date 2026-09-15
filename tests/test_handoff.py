@@ -284,6 +284,22 @@ def test_spider_partitions_and_hands_over() -> bool:
                     f"owns {len(mine)}"
                 )
                 return False
+
+            # A handed-over URL goes straight to _admit, which calls
+            # url_seen, which requires an already-canonical URL. The inbox
+            # must therefore preserve the sender's canonical form exactly:
+            # any rewriting in transit would make the two shards fingerprint
+            # the same page differently and the dupefilter would stop working
+            # across the boundary.
+            from w3lib.url import canonicalize_url
+
+            mangled = [u for u in handed if canonicalize_url(u) != u]
+            if mangled:
+                print(
+                    f"FAIL: {len(mangled)} handed url(s) are not canonical, "
+                    f"e.g. {mangled[0]}"
+                )
+                return False
             spider.handoff.close()
 
         # discovered_raw must be counted before the shard check, so a URL

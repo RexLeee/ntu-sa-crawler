@@ -27,7 +27,6 @@ from pathlib import Path
 from rbloom import Bloom
 from scrapy.dupefilters import BaseDupeFilter
 from scrapy.utils.job import job_dir
-from w3lib.url import canonicalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +89,7 @@ class BloomDupeFilter(BaseDupeFilter):
         return False
 
     def url_seen(self, url: str) -> bool:
-        """Test and record a URL without building a Request first.
+        """Test and record a URL that is ALREADY canonical.
 
         Three quarters of the requests a broad crawl yields are duplicates: a
         measured 28 minutes produced 3,319,826 filtered against 1,106,885
@@ -105,11 +104,22 @@ class BloomDupeFilter(BaseDupeFilter):
         requests method is GET with an empty body and no included headers, so
         only the canonical URL varies. tests/test_dupefilter.py holds the two
         implementations against each other on real URLs.
+
+        The caller must pass the output of UrlFilter.normalize(), which ends in
+        canonicalize_url(). This method used to call it a second time, which
+        cannot change the value because canonicalize_url is idempotent, and
+        cost 10.77 us of the 12.79 us this method took, measured over 20,000
+        URLs. Both callers satisfy the precondition: spider _maybe_follow()
+        passes a normalize() result directly, and _drain_handoff() passes a
+        line from the inbox, which the sending shard wrote from its own
+        normalize() result without modifying it. Seeds do not reach here at
+        all; they are yielded with dont_filter=False and go through Scrapy's
+        own request_seen(), which fingerprints from scratch.
         """
         payload = json.dumps(
             {
                 "method": "GET",
-                "url": canonicalize_url(url),
+                "url": url,
                 "body": "",
                 "headers": {},
             },

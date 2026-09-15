@@ -25,11 +25,28 @@ asyncioreactor.install()
 from scrapy import Request  # noqa: E402
 from scrapy.utils.request import RequestFingerprinter  # noqa: E402
 
+from crawler.config import load_config  # noqa: E402
 from crawler.dupefilter import BloomDupeFilter  # noqa: E402
+from crawler.filters import UrlFilter  # noqa: E402
+
+# url_seen takes an already-canonical URL, so every URL below is passed
+# through the same UrlFilter.normalize() the spider uses before it calls the
+# filter. Feeding raw URLs here would test a path production never takes, and
+# would hide a regression in exactly the direction that matters: normalize()
+# growing a step that leaves a URL non-canonical.
+_NORMALIZE = UrlFilter(load_config()).normalize
+
+
+def canonical(url: str) -> str:
+    """The URL as the spider would hand it to url_seen."""
+    out = _NORMALIZE(url, url)
+    assert out is not None, f"normalize rejected a test URL: {url}"
+    return out
+
 
 # Shapes a broad crawl actually meets: mixed case, default ports, fragments,
 # unsorted query strings, percent-encoding, non-ASCII, dot segments, spaces.
-URLS = [
+RAW_URLS = [
     "https://example.com/",
     "https://example.com",
     "https://EXAMPLE.com/",
@@ -47,6 +64,8 @@ URLS = [
     "https://sub.example.co.uk/deep/path/here?x=1&y=2&z=3",
     "https://example.com/" + "a" * 500,
 ]
+
+URLS = [canonical(u) for u in RAW_URLS]
 
 failures = 0
 
@@ -110,25 +129,41 @@ def main() -> int:
 
         # 3. First call False, second call True.
         df2 = _filter(tmp + "/x")
-        first = df2.url_seen("https://first.example/page")
-        second = df2.url_seen("https://first.example/page")
+        first = df2.url_seen(canonical("https://first.example/page"))
+        second = df2.url_seen(canonical("https://first.example/page"))
         check("url_seen records on first call", first is False and second is True)
 
         # 4. Distinct URLs stay distinct. At 1e-9 over 1,000 URLs a false
         # positive is far less likely than a real bug in the digest.
         df3 = _filter(tmp + "/y")
         collisions = sum(
-            1 for i in range(1000) if df3.url_seen(f"https://d{i}.example/p/{i}")
+            1
+            for i in range(1000)
+            if df3.url_seen(canonical(f"https://d{i}.example/p/{i}"))
         )
         check("1,000 distinct URLs produce no false duplicate", collisions == 0,
               f"{collisions} collisions")
 
         # 5. URLs that differ only cosmetically collapse, in both paths.
         df4 = _filter(tmp + "/z")
-        df4.url_seen("https://example.com/a?b=2&a=1")
+        df4.url_seen(canonical("https://example.com/a?b=2&a=1"))
         check(
             "cosmetic variants collapse",
-            df4.url_seen("https://example.com/a?a=1&b=2#frag"),
+            df4.url_seen(canonical("https://example.com/a?a=1&b=2#frag")),
+        )
+
+        # 5b. The precondition url_seen now relies on: normalize() returns a
+        # canonical URL, so canonicalizing it again cannot change it. If this
+        # ever fails, url_seen is fingerprinting a different string from the
+        # one the scheduler will fingerprint, and the dupefilter silently
+        # stops working.
+        from w3lib.url import canonicalize_url
+
+        not_canonical = [u for u in URLS if canonicalize_url(u) != u]
+        check(
+            "normalize() output is already canonical",
+            not not_canonical,
+            f"{len(not_canonical)} not canonical: {not_canonical[:3]}",
         )
 
         del df

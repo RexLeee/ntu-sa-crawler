@@ -205,10 +205,22 @@ echo "stopping     : $(date -Iseconds)"
 for pid in "${PIDS[@]}"; do
     kill -TERM "$pid" 2>/dev/null || true
 done
-for _ in $(seq 1 20); do
+# 20s was not enough: every run so far was SIGKILLed before Scrapy wrote
+# "Dumping Scrapy stats", which is the only place exception_type_count and
+# response_status_count exist. Without it there is no way to classify the 22%
+# of requests that fail. download_timeout is 10s, so the in-flight set should
+# drain in about that long once no new requests are dispatched.
+#
+# This is a measurement, not a setting. The elapsed time is printed below: if
+# a shard still needs the full window, raising it further is not the answer,
+# because it means shutdown is waiting on something other than the timeout.
+GRACE="${GRACE:-90}"
+STOP_START=$(date +%s)
+for _ in $(seq 1 "$GRACE"); do
     any_alive || break
     sleep 1
 done
+echo "drained in   : $(($(date +%s) - STOP_START))s (grace ${GRACE}s)"
 for pid in "${PIDS[@]}"; do
     # `uv run` is the parent; killing it alone leaves the python child running.
     pkill -9 -P "$pid" 2>/dev/null || true

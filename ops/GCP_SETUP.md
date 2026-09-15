@@ -210,7 +210,7 @@ tail -1 data/runstats.tsv                 # main_cpu_pct, requests, responses
 |---|---|---|
 | **Response rate** | `responses / requests` in `runstats.tsv` | **Below 30% means do not migrate** |
 | Main thread CPU | `main_cpu_pct` | Near 99% means the link is no longer the ceiling |
-| RSS | `resources.tsv` | Must stay well under the 2,200 MB warning |
+| RSS | `resources.tsv` | Per shard under the 2,500 MB warning, and the total well under the machine's 7.9 GB |
 | Compliance | both verifiers | 0 and 0 |
 
 Response rate is the decision. Published figures put datacenter IP success at
@@ -261,7 +261,34 @@ releases the disk and the ephemeral IP together.
 |---|---|---|
 | `ops/run_hour.sh` | `ulimit -n` takes `ulimit -Hn` instead of 1,000,000 | A bare `ulimit` to a value above the host's ceiling returns non-zero and `set -e` kills the run before the first page |
 | `ops/run_hour.sh` | Exports `TLDEXTRACT_CACHE` under `state/` | Keeps domain keying identical across runs; see the warm-up section |
-| `config.toml` | `memusage_limit_mb` 7000 to 2800, warning 5500 to 2200 | 7000 exceeds the 4 GB of physical RAM, so the OOM killer would act first and the guard would never fire |
+| `config.toml` | `memusage_limit_mb` 7000 to 3000, warning 5500 to 2500 | The value is per process. At `shards = 2` on a 7.9 GB machine anything above 3000 puts the combined limit over physical RAM, so the OOM killer would act first and the guard would never fire |
+| `config.toml` | `shards` 1 to 2 | The link is 0.8% used on this machine, so the condition the old note set for sharding is met. See "Why two shards" below |
+| `crawler/dupefilter.py` | `url_seen()` no longer calls `canonicalize_url` | Its caller passes a `UrlFilter.normalize()` result, which is already canonical. The second call cost 10.77 us of the method's 12.79 us and could not change the value |
+| `ops/run_hour.sh` | Shutdown grace 20s to 90s | Every run so far was SIGKILLed before Scrapy wrote `Dumping Scrapy stats`, which is the only source of `exception_type_count` |
+
+## Why two shards
+
+The migration notes above argued that larger machines buy nothing because the
+crawl is network-bound. That was measured on the WSL host, whose Wi-Fi link the
+crawl had saturated to 72%. It does not hold here.
+
+| | Measured on t2d-standard-2 |
+|---|---|
+| Link used | 12.0 Mbps of 1,570 Mbps, **0.8%** |
+| `proc_cpu_pct` | 100.5%, where two dedicated cores allow 200% |
+| `main_cpu_pct` | 99.5% of that |
+| Reactor lag, median | 2,631 ms against a 5.0s per-domain gap |
+| `dl_slots` at 604s | 8,783 domains, a ceiling of 1,757 pages/s |
+| Actual | 25.52 pages/s, **1.5% of that ceiling** |
+
+The last two rows are the ones that settle it. Domain supply is not short: the
+reactor cannot dispatch what is already available. Scrapy's own optimization
+guide says splitting into processes is the only way to use a second core.
+
+`concurrent_requests` stays at 3000 despite the note in `config.toml` saying to
+raise it when sharding. That note describes a shard starved of domains, which
+is not this machine: `dl_active` last touched the 3000 ceiling at 31 seconds
+and sat below it for the rest of the run.
 
 `bloom_capacity` and `frontier_max_size` were deliberately left alone. The
 bloom filter's 171 MB is a fixed allocation and shrinking it would raise the

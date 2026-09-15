@@ -38,6 +38,33 @@ reactor 延遲最大 1.9 秒，事件迴圈確實塞住了。
 所以 `README.md` 裡「reactor thread is the fourth ceiling」那一節的推論成立，
 而且是直接量到的，不再是推論。
 
+## ⚠️ 跑測中途發現的 bug，已修但跑測沒吃到
+
+`38f179c` 修了一個靜默的 bug。**正在跑的這次測試是在修正前啟動的，所以
+它的吞吐量數字偏低。**
+
+Bug：spider 在自己的 `from_crawler` 裡讀 `crawler.bloom_dupefilter`，
+但 `Crawler.crawl` 先建 spider、後建 engine，而 dupefilter 是 engine
+建 scheduler 時才產生的。所以那個屬性當下不存在，`spider.dupefilter`
+被設成 `None`。
+
+**沒有任何東西壞掉。** scheduler 還是會過濾重複，爬取結果完全正確。
+只是「先查 bloom 再建 Request」這個最佳化整個沒生效，白做了它要省的工。
+唯一的症狀是 `dupe_skipped` 一直是 0，對照 `discovered` 已經 768,922。
+
+修法是改在 `spider_opened` 綁定。45 秒的 smoke run 現在會跳過 8,211 個
+Request。`tests/test_dupefilter.py` 多了一個案例，用真實順序建 spider 和
+engine 來驗證綁定。
+
+**所以：**
+
+- 這次跑測的 politeness、robots、記憶體、CPU 數字**都有效**
+- 它的 **pages/s 偏低**，因為每個重複 URL 還是建了 Request
+- 要拿正確的吞吐量，跑完後 `git pull` 再跑一次，或直接接受它是下限
+
+判斷要不要重跑之前，先看這次的 CPU 數字。主執行緒已經 99%，多 process
+才是主要的槓桿，這個修正是次要的。
+
 ## 剩下要從這次跑測拿到的東西
 
 | 問題 | 看哪裡 | 判準 |
@@ -115,6 +142,21 @@ Tailnet 上另外兩台 Ubuntu 主機
 是**公司機器，絕對不能用**。使用者明確說過「不能用那是公司的機器」。
 
 GitHub repo 保持 **Private**。
+
+## 使用者現在不在
+
+使用者出門了，Mac 關機。這個 session 是接手用的。
+
+**可以自己做的：** 讀資料、跑分析腳本、改程式碼、跑測試、commit。
+
+**要等使用者回來才做的：**
+
+- 開始 48 小時正式跑測。開跑時間是他的決定，截止是 9/17 00:00
+- 暫停 Windows Update。沒有命令列做法
+- 任何會刪掉跑測資料的事
+
+跑測 14:12 左右結束。結束後照上面的驗收流程跑完，把結果整理好等他回來。
+如果決定要重跑一次拿正確的吞吐量數字，那是可逆的，可以自己做。
 
 ## 兩個提醒
 

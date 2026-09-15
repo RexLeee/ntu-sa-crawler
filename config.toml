@@ -57,9 +57,20 @@ include_psl_private_domains = true
 #     pages/sec <= distinct domains in active / download_delay
 #
 # At 200 a measured run held only ~57 distinct domains and managed
-# 3.82 pages/s. A parked request holds no socket and costs ~3 KB, so 3000
-# costs about 9 MB.
-concurrent_requests = 3000
+# 3.82 pages/s. A parked request holds no socket and costs ~3 KB, so 12000
+# costs about 36 MB.
+#
+# Per process, and it does NOT divide by the shard count. The first sharded
+# run kept 3000 here and got slower than one process: 45.7 pages/s against
+# 54.5. Every shard sat at exactly 3000 active with only ~1,400 domain slots,
+# while the single process spread the same 3000 over 6,551 slots. A shard
+# owns a quarter of the domains, so a budget that a single process spent
+# reaching many domains gets spent stacking requests on the few this shard
+# holds, and the budget runs out before the domains do.
+#
+# The bound is domains in flight, so this has to be large enough that the
+# shard's own domain count is what limits it. Raised rather than divided.
+concurrent_requests = 12000
 download_timeout = 10
 # Scrapy's default is 60s with no negative cache (see the TODO in
 # scrapy/resolver.py). Lookups run in the reactor thread pool, so one dead

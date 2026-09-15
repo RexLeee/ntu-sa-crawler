@@ -42,9 +42,16 @@ def count_discovered(paths: list[Path]) -> tuple[int, int]:
     if not paths:
         return 0, 0
 
-    files = " ".join(f"'{p}'" for p in paths)
+    # One zcat per file, not one zcat over all of them. Every run this project
+    # makes ends in SIGKILL, so the last gzip member has no end-of-stream
+    # marker and zcat reports "unexpected end of file". Given several files it
+    # stops there and never reads the rest, while still exiting 0 through the
+    # pipe: a 4 shard run reported 116,000 discovered URLs instead of 448,000,
+    # with no error shown. Reading each file in its own zcat contains the
+    # failure to the file that is actually truncated.
+    reads = "; ".join(f"zcat -f '{p}' 2>/dev/null || true" for p in paths)
     # LC_ALL=C compares bytes, which is both correct for URLs and much faster.
-    pipeline = f"zcat -f {files} | LC_ALL=C sort -u | wc -l"
+    pipeline = f"{{ {reads}; }} | LC_ALL=C sort -u | wc -l"
     try:
         out = subprocess.run(
             ["sh", "-c", pipeline], capture_output=True, text=True, check=True

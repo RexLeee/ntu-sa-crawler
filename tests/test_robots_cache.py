@@ -30,6 +30,7 @@ asyncioreactor.install()
 import asyncio  # noqa: E402
 
 from scrapy import Request  # noqa: E402
+from scrapy.exceptions import IgnoreRequest  # noqa: E402
 from scrapy.http import TextResponse  # noqa: E402
 from scrapy.utils.test import get_crawler  # noqa: E402
 
@@ -160,6 +161,92 @@ def test_rules_are_actually_applied() -> bool:
     return True
 
 
+class FailingEngine:
+    """Engine stub whose robots.txt fetches fail, as a dead host's would."""
+
+    def __init__(self):
+        self.fetched: list[str] = []
+
+    async def download_async(self, request):
+        self.fetched.append(request.url)
+        raise TimeoutError("robots.txt fetch timed out")
+
+
+def _failing_middleware(**settings):
+    crawler = get_crawler(
+        BroadSpider,
+        {"DOWNLOAD_DELAY": 5.0, "ROBOTSTXT_OBEY": True, "ROBOTS_CACHE_SIZE": 100, **settings},
+    )
+    crawler._apply_settings()
+    crawler.spider = crawler._create_spider()
+    mw = PoliteRobotsTxtMiddleware(crawler)
+    engine = FailingEngine()
+    crawler.engine = engine
+    return mw, engine
+
+
+def test_unreadable_robots_refuses() -> bool:
+    """An unreadable robots.txt must block the request, not permit it.
+
+    Scrapy's process_request_2 returns silently when the parser is None, which
+    treats a failed fetch as blanket permission. A 2 hour run fetched two URLs
+    under Disallow: /reports/ and Disallow: /survey on www.eia.gov exactly
+    that way. Under load the failures are not rare: an earlier run timed out
+    on 40,957 of 45,825 robots fetches.
+    """
+    mw, _ = _failing_middleware()
+
+    async def run():
+        request = Request("https://dead.example/page")
+        rp = await mw.robot_parser(request)
+        try:
+            mw.process_request_2(rp, request)
+        except IgnoreRequest:
+            return True
+        return False
+
+    refused = asyncio.get_event_loop().run_until_complete(run())
+    if not refused:
+        print("FAIL: an unreadable robots.txt allowed the request")
+        return False
+    print("PASS: an unreadable robots.txt refuses the request")
+    return True
+
+
+def test_failure_expires() -> bool:
+    """A cached failure must expire, or one timeout silences a host forever."""
+    mw, engine = _failing_middleware(ROBOTS_FAILURE_TTL=0.0)
+
+    async def run():
+        await mw.robot_parser(Request("https://flaky.example/a"))
+        # With a zero TTL the cached failure is already stale, so the next
+        # request must try again rather than reuse it.
+        await mw.robot_parser(Request("https://flaky.example/b"))
+
+    asyncio.get_event_loop().run_until_complete(run())
+    attempts = sum(1 for u in engine.fetched if "flaky.example" in u)
+    if attempts != 2:
+        print(f"FAIL: expired failure produced {attempts} fetches, expected 2")
+        return False
+
+    # And the opposite: within the TTL it must NOT re-fetch, or a dead host
+    # would be retried on every single URL.
+    mw2, engine2 = _failing_middleware(ROBOTS_FAILURE_TTL=3600.0)
+
+    async def run2():
+        await mw2.robot_parser(Request("https://dead.example/a"))
+        await mw2.robot_parser(Request("https://dead.example/b"))
+
+    asyncio.get_event_loop().run_until_complete(run2())
+    held = sum(1 for u in engine2.fetched if "dead.example" in u)
+    if held != 1:
+        print(f"FAIL: failure within TTL produced {held} fetches, expected 1")
+        return False
+
+    print("PASS: cached failures expire after the TTL and are held within it")
+    return True
+
+
 def main() -> int:
     results = [
         test_eviction_refetches(),
@@ -167,6 +254,8 @@ def main() -> int:
         test_concurrent_requests_share_one_fetch(),
         test_inflight_is_drained(),
         test_rules_are_actually_applied(),
+        test_unreadable_robots_refuses(),
+        test_failure_expires(),
     ]
     return 0 if all(results) else 1
 

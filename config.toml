@@ -162,6 +162,17 @@ memusage_warning_mb = 5500
 # 5.3 GB RSS seen in an 87 minute run. Evicting only costs a re-fetch; the
 # robots check itself is never skipped.
 robots_cache_size = 50_000
+# What to do when robots.txt cannot be read at all. Scrapy's convention, and
+# the usual one, is to treat an unreadable file as permission to crawl
+# everything. The assignment says "NO violation", and the difference is not
+# theoretical: a 2 hour run fetched two URLs under Disallow: /reports/ and
+# Disallow: /survey on www.eia.gov because a transient failure had cached
+# "unknown" for that host. Refusing costs pages on hosts we cannot read.
+robots_strict_on_failure = true
+# How long an unreadable robots.txt stays unreadable before we try again.
+# Without this, one timeout during a traffic spike would silence a host for
+# the rest of the 48 hours.
+robots_failure_ttl = 300.0
 
 [paths]
 data_dir = "data"

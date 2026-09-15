@@ -81,6 +81,10 @@ MEMUSAGE_WARNING_MB = _mem["memusage_warning_mb"]
 # 8 KB each that dict alone reaches several GB in a broad crawl, which was the
 # main driver of memory growth. See crawler/middlewares/robots.py.
 ROBOTS_CACHE_SIZE = _mem["robots_cache_size"]
+# An unreadable robots.txt means "do not crawl", not "crawl anything". See
+# crawler/middlewares/robots.py.
+ROBOTS_STRICT_ON_FAILURE = _mem["robots_strict_on_failure"]
+ROBOTS_FAILURE_TTL = _mem["robots_failure_ttl"]
 
 # --- trimming ---------------------------------------------------------------
 COOKIES_ENABLED = _crawl["cookies_enabled"]

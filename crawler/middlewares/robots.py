@@ -13,6 +13,7 @@ This subclass closes both.
 from __future__ import annotations
 
 import logging
+import time
 
 from scrapy import Request, signals
 from scrapy.downloadermiddlewares.robotstxt import RobotsTxtMiddleware
@@ -54,6 +55,21 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         cache_size = crawler.settings.getint("ROBOTS_CACHE_SIZE", 50_000)
         self._parsers = LocalCache(limit=cache_size)
 
+        # Treat an unreadable robots.txt as "do not crawl" rather than as
+        # permission. See process_request_2 for why.
+        self._strict_on_failure: bool = crawler.settings.getbool(
+            "ROBOTS_STRICT_ON_FAILURE", True
+        )
+        # A failed fetch must not be cached forever, or one timeout during a
+        # traffic spike would silence a host for the rest of the run. These
+        # entries expire and the next request re-fetches.
+        self._failure_ttl: float = crawler.settings.getfloat("ROBOTS_FAILURE_TTL", 300.0)
+        # Bounded for the same reason as _parsers: keyed by host, it would
+        # otherwise grow for the whole 48 hours. Losing an entry only means
+        # the failure is treated as fresh, which re-fetches a little later
+        # than it had to. It never grants access.
+        self._failed_at = LocalCache(limit=cache_size)
+
         # Fetches currently running. Unbounded on purpose, but its size is the
         # number of concurrent robots fetches, not the number of hosts ever
         # seen, and every entry is removed when its fetch settles.
@@ -87,7 +103,19 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
 
         parser = self._parsers.get(netloc, _MISSING)
         if parser is not _MISSING:
-            return parser
+            # A cached failure is only good for _failure_ttl seconds. Past
+            # that, drop it and re-fetch: the host may simply have been busy
+            # when we first asked, and holding the failure would keep the
+            # whole domain uncrawlable for the rest of the run.
+            if parser is None:
+                failed_at = self._failed_at.get(netloc)
+                if failed_at is not None and time.monotonic() - failed_at >= self._failure_ttl:
+                    self._parsers.pop(netloc, None)
+                    self._failed_at.pop(netloc, None)
+                else:
+                    return None
+            else:
+                return parser
 
         pending = self._inflight.get(netloc)
         if pending is not None:
@@ -146,6 +174,8 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
             request=request,
         )
         self._parsers[netloc] = rp
+        # A later success supersedes an earlier failure for this host.
+        self._failed_at.pop(netloc, None)
         rp_dfd = self._inflight.get(netloc)
         if rp_dfd is not None:
             rp_dfd.callback(rp)
@@ -155,6 +185,7 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         if not isinstance(exc, IgnoreRequest):
             self._stats.inc_value(f"robotstxt/exception_count/{type(exc)}")
         self._parsers[netloc] = None
+        self._failed_at[netloc] = time.monotonic()
         rp_dfd = self._inflight.get(netloc)
         if rp_dfd is not None:
             rp_dfd.callback(None)
@@ -191,4 +222,21 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         key = request.meta.get("download_slot")
         if key and key in self._pending_delays:
             self._apply_delay(key, self._pending_delays[key])
+
+        # The parent returns silently when rp is None, which treats an
+        # unreadable robots.txt as permission to crawl everything. That is the
+        # usual convention, but the assignment's requirement is "NO violation",
+        # and a 2 hour run showed the difference is not theoretical: two URLs
+        # under Disallow: /reports/ and Disallow: /survey on www.eia.gov were
+        # fetched because a transient failure had cached None for that host.
+        #
+        # Under load those failures are common rather than rare. In the
+        # earlier 28 minute run 40,957 of 45,825 robots fetches timed out, so
+        # most hosts were being crawled on a None parser. Refusing instead
+        # costs pages on hosts we cannot read, and the re-fetch on the next
+        # attempt is what recovers them.
+        if rp is None and self._strict_on_failure:
+            self._stats.inc_value("robotstxt/refused_unknown_rules")
+            raise IgnoreRequest("robots.txt could not be read")
+
         super().process_request_2(rp, request)

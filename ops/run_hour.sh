@@ -214,6 +214,14 @@ done
 # This is a measurement, not a setting. The elapsed time is printed below: if
 # a shard still needs the full window, raising it further is not the answer,
 # because it means shutdown is waiting on something other than the timeout.
+#
+# Measured at 90: both shards used the entire window and were still SIGKILLed
+# without writing "Dumping Scrapy stats". A shard was still logging fetched
+# pages 71 seconds after its SIGTERM, and neither log contains "Closing
+# spider", so the signal is not reaching the engine's shutdown path at all
+# rather than the drain being slow. Raising this again will not help. The
+# stats dump needs a real close reason, which means CLOSESPIDER_TIMEOUT
+# inside the crawl rather than a signal from outside it.
 GRACE="${GRACE:-90}"
 STOP_START=$(date +%s)
 for _ in $(seq 1 "$GRACE"); do

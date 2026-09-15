@@ -174,6 +174,19 @@ follow_meta_refresh = false
 #
 # Every limit in [memory] is per process, so they are sized for one shard's
 # share and total RSS is what has to clear the 7.9 GB this machine has.
+#
+# Measured at 2, against the single process on the same machine: 53.09 pages/s
+# against 25.51, 2.08x, for 1.60x the memory. Both shards held 97-98% CPU for
+# the whole run, so the second core is genuinely working. Response rate rose
+# slightly, 79.6% against 77.9%, which is the opposite of the WSL result where
+# four shards dropped it from 48% to 28% by contending for a full link.
+#
+# It cost one politeness violation. See required_min_gap: the dispatch timer
+# reserves a turn, and a reactor stall between reserving and writing to the
+# socket shortens the gap the server sees. Median lag improved with sharding,
+# 1,900 ms against 2,164 ms, but the tail got worse on one shard, 12,091 ms
+# against 10,760 ms, and the tail is what breaks the gap. 32,000 requests
+# produced exactly one short gap, at 2.604s against the 5.0s floor.
 shards = 2
 # How often each process drains the URLs other shards handed it. The poll is a
 # few file reads, and a URL waiting here is a domain not yet being crawled, so

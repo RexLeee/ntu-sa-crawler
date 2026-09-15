@@ -37,7 +37,15 @@ class BroadSpider(Spider):
         # before the socket write. DOWNLOAD_DELAY schedules above it; this
         # catches the cases where event-loop congestion would let a pair slip
         # under. See crawler/dispatch.py.
-        install_dispatch_timer(self.cfg["politeness"]["required_min_gap"])
+        # The trace records any dispatch pair that lands closer than the floor,
+        # with the slot and timer state that produced it. A 10 minute run put
+        # two panasonic.jp requests at one timestamp and no offline
+        # reproduction could recreate it, so the remaining way to find the
+        # cause is to record it in production. It writes only on a short gap.
+        trace = None
+        if self.cfg["politeness"].get("trace_short_gaps", False):
+            trace = str(data_dir() / "violation-trace.log")
+        install_dispatch_timer(self.cfg["politeness"]["required_min_gap"], trace)
         self.filter = UrlFilter(self.cfg)
 
         limits = self.cfg["limits"]

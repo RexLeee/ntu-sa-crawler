@@ -34,6 +34,13 @@ required_min_gap = 5.0
 # Must stay 0 or we violate the rate limit.
 download_delay_jitter = 0.0
 concurrent_requests_per_domain = 1
+# Dump the timer and slot state whenever two dispatches on one domain land
+# closer than required_min_gap. A 10 minute run produced exactly one such pair
+# (panasonic.jp, both at the same millisecond) and none of eight offline
+# reproductions could recreate it, so the cause has to be caught in
+# production. The check is two dict operations per dispatch and writes nothing
+# unless a gap is short, so it stays on for the 48 hour run.
+trace_short_gaps = true
 obey_robotstxt = true
 # Treat eTLD+1 as the politeness unit. Includes PSL private domains, so
 # foo.blogspot.com and bar.blogspot.com count as separate domains.

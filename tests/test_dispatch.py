@@ -187,13 +187,88 @@ def run_scenario(name: str) -> int:
     return 0
 
 
+def test_reservation_never_moves_backwards() -> int:
+    """A dispatch must not overwrite a sibling's later reserved turn.
+
+    Each coroutine claims its turn before awaiting, writing turn + gap into
+    the shared dict. When it finally dispatches it writes again, from the real
+    dispatch time. That second write used to be unconditional, so a coroutine
+    that dispatched while a sibling held a later reservation would replace the
+    sibling's value with a smaller one. The next arrival then claimed the turn
+    the sibling was already sleeping on, and the two went out together.
+
+    Checked on the dict itself rather than through a crawl, because the losing
+    interleaving depends on event loop timing that a test cannot force
+    reliably. What it can assert is the invariant: the stored value never
+    decreases.
+    """
+    import asyncio
+
+    import scrapy.core.downloader as dl
+
+    async def noop(self, slot, request):
+        return None
+
+    dl.Downloader._download = noop
+    install(5.0)
+    patched = dl.Downloader._download
+
+    # The claim dict is the only empty dict in the closure.
+    reservations = next(
+        cell.cell_contents
+        for cell in patched.__closure__
+        if isinstance(cell.cell_contents, dict) and not cell.cell_contents
+    )
+
+    class _Slot:
+        pass
+
+    class _Req:
+        def __init__(self, url):
+            self.url = url
+            self.meta = {"download_slot": "d.example"}
+
+    seen: list[float] = []
+
+    async def watch():
+        # Sample the reservation while three requests claim and dispatch.
+        for _ in range(60):
+            value = reservations.get("d.example")
+            if value is not None:
+                seen.append(value)
+            await asyncio.sleep(0.05)
+
+    async def drive():
+        await asyncio.gather(
+            *(patched(None, _Slot(), _Req(f"https://d.example/{i}")) for i in range(3)),
+            watch(),
+        )
+
+    asyncio.run(drive())
+
+    drops = [
+        (a, b) for a, b in zip(seen, seen[1:], strict=False) if b < a - 1e-9
+    ]
+    if drops:
+        a, b = drops[0]
+        print(
+            f"FAIL [reservation]: value moved backwards, {a:.6f} -> {b:.6f} "
+            f"({len(drops)} times)"
+        )
+        return 1
+    print(f"PASS [reservation]: never decreased across {len(seen)} samples")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "reservation":
+        return test_reservation_never_moves_backwards()
     if len(sys.argv) > 1:
         return run_scenario(sys.argv[1])
 
     # Parent: run each scenario in its own interpreter.
     failures = 0
-    for name in SCENARIOS:
+    for name in [*SCENARIOS, "reservation"]:
         result = subprocess.run([sys.executable, __file__, name], check=False)
         failures += result.returncode != 0
     return 1 if failures else 0

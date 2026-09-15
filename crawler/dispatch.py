@@ -43,7 +43,9 @@ Both behaviours are verified by tests/test_dispatch.py.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+import traceback
 
 import scrapy.core.downloader as _dl
 
@@ -54,11 +56,34 @@ DISPATCH_TIME = "dispatch_time"
 _installed = False
 
 
-def install(min_gap: float = 0.0) -> None:
+def _open_trace(path: str):
+    """Open the diagnostic log, or return None if it cannot be written.
+
+    Diagnostics must never take the crawl down, so a failure here is silent
+    and simply disables tracing.
+    """
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        return open(path, "a", buffering=1, encoding="utf-8")
+    except OSError:
+        return None
+
+
+def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
     """Stamp meta['dispatch_time'] and hold each slot to min_gap seconds.
 
     A min_gap of 0 only measures, which is what the dispatch timing test needs
     when it exercises Scrapy's own delay.
+
+    When trace_path is set, every dispatch closer than min_gap to the previous
+    one on the same slot is dumped there with the state that produced it. A 10
+    minute run put two panasonic.jp requests at the identical timestamp and
+    none of the offline reproductions could recreate it, so the remaining way
+    to find the cause is to record it as it happens. The check is two dict
+    operations per dispatch and only writes when a gap is short, so it is
+    cheap enough to leave on for the full 48 hours.
     """
     global _installed
     if _installed:
@@ -84,6 +109,52 @@ def install(min_gap: float = 0.0) -> None:
     # The domain string is stable across slot GC and unique between domains,
     # which is exactly the identity the rate limit is defined on.
     next_allowed: dict[str, float] = {}
+
+    # Diagnostics. last_dispatch records what actually went out per slot, which
+    # is what the compliance check measures; next_allowed records what was
+    # promised. A short gap means those two disagree, and the dump says how.
+    trace_fh = _open_trace(trace_path) if trace_path else None
+    last_dispatch: dict[str, tuple[float, str, float]] = {}
+
+    def _trace_short_gap(downloader, slot, request, slot_id, claimed_turn, dispatched):
+        previous = last_dispatch.get(slot_id)
+        last_dispatch[slot_id] = (dispatched, request.url, claimed_turn)
+        if previous is None:
+            return
+        gap = dispatched - previous[0]
+        if gap >= min_gap - 0.05:
+            return
+        interesting = (
+            "download_slot",
+            "new_domain",
+            "seed",
+            "depth",
+            "redirect_urls",
+            "redirect_times",
+            "dont_obey_robotstxt",
+        )
+        meta = {k: v for k, v in request.meta.items() if k in interesting}
+        trace_fh.write(
+            f"=== SHORT GAP {gap:.6f}s slot={slot_id!r} min_gap={min_gap}\n"
+            f"  prev  dispatched={previous[0]:.6f} claimed_turn={previous[2]:.6f}"
+            f" url={previous[1]}\n"
+            f"  curr  dispatched={dispatched:.6f} claimed_turn={claimed_turn:.6f}"
+            f" url={request.url}\n"
+            f"  next_allowed[slot]={next_allowed.get(slot_id, float('nan')):.6f}"
+            f"  dict_size={len(next_allowed)}\n"
+            f"  slot obj={id(slot)} delay={getattr(slot, 'delay', '?')}"
+            f" concurrency={getattr(slot, 'concurrency', '?')}"
+            f" lastseen={getattr(slot, 'lastseen', '?')}\n"
+            f"  len(active)={len(getattr(slot, 'active', ()))}"
+            f" len(transferring)={len(getattr(slot, 'transferring', ()))}"
+            f" len(queue)={len(getattr(slot, 'queue', ()))}\n"
+            f"  slot_is_live={getattr(downloader, 'slots', {}).get(slot_id) is slot}\n"
+            f"  meta={meta}\n"
+            f"  stack:\n"
+        )
+        for frame in traceback.format_stack(limit=20):
+            trace_fh.write("    " + frame.rstrip().replace("\n", "\n    ") + "\n")
+        trace_fh.write("\n")
 
     async def _download_with_stamp(self, slot, request):
         if min_gap > 0:
@@ -111,8 +182,17 @@ def install(min_gap: float = 0.0) -> None:
             # Advance from the moment the request actually goes out, not from
             # the moment it was scheduled to, so lateness never compounds into
             # a short gap for the next one.
+            #
+            # max(), not a plain assignment. While this coroutine slept, a
+            # sibling on the same slot may have claimed a later turn and
+            # written it here. Overwriting that with dispatched + min_gap
+            # would hand the sibling's reserved turn to the next arrival, and
+            # the two would go out together. Only ever move the reservation
+            # forward.
             dispatched = time.time()
-            next_allowed[slot_id] = dispatched + min_gap
+            next_allowed[slot_id] = max(
+                next_allowed.get(slot_id, 0.0), dispatched + min_gap
+            )
 
             # Bound the dict. Entries whose gap has already elapsed can never
             # constrain a future request, so dropping them is safe: the next
@@ -128,6 +208,8 @@ def install(min_gap: float = 0.0) -> None:
                     del next_allowed[key]
 
             request.meta[DISPATCH_TIME] = dispatched
+            if trace_fh is not None:
+                _trace_short_gap(self, slot, request, slot_id, turn, dispatched)
         else:
             request.meta[DISPATCH_TIME] = time.time()
         return await original(self, slot, request)

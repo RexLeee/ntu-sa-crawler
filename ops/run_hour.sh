@@ -36,6 +36,11 @@ mkdir -p "$RUNDIR"
 
 # Start clean so the metrics describe this run alone.
 rm -f data/crawled.log.gz data/discovered.log.gz data/runstats.tsv data/objects.log
+# The trace is opened in append mode, so a previous run's contents would be
+# read as this one's. It is now a pass/fail signal rather than a diagnostic:
+# the timer and ops/verify_politeness.py group by the same key, so anything
+# written here is a real short gap.
+rm -f data/violation-trace.log
 rm -rf state/job
 
 echo "run dir      : $RUNDIR"
@@ -59,6 +64,7 @@ echo "pid          : $CRAWL_PID"
 collect() {
     cp data/crawled.log.gz data/discovered.log.gz "$RUNDIR/" 2>/dev/null || true
     cp data/runstats.tsv data/objects.log "$RUNDIR/" 2>/dev/null || true
+    cp data/violation-trace.log "$RUNDIR/" 2>/dev/null || true
 }
 trap collect EXIT INT TERM
 

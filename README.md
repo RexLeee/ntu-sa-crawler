@@ -314,6 +314,58 @@ sharding across processes because it needs no new failure modes. Sharding
 remains available afterwards; the profile should be re-taken first, since
 removing half the CPU cost will move the bottleneck somewhere new.
 
+#### The fix, and what it moved
+
+`crawler/pqueue.py` keeps the domains in a deque and stops at the first one
+with no active download, rotating what it skips to the back. The selection
+rule is unchanged: fewest active downloads first, ties broken by rotation.
+With `CONCURRENT_REQUESTS_PER_DOMAIN=1` almost every queue holds 0 or 1
+active downloads, so the rule is really "find an idle domain", and finding one
+does not require looking at all of them. The scan is capped by
+`PQUEUE_SCAN_LIMIT`; on reaching it the least-active domain seen wins, which
+is the parent's answer over a window.
+
+Microseconds per `pop()`, measured:
+
+| Domains | Parent | Ring | Speedup |
+|---|---|---|---|
+| 200 | 3.98 | 0.30 | 13x |
+| 2,000 | 141.67 | 0.90 | 157x |
+| 20,000 | 1,734.12 | 1.09 | 1,597x |
+| 50,000 | 4,863.36 | 1.12 | 4,340x |
+
+The parent is linear; the ring is flat. A second profile taken under the same
+conditions:
+
+| Component | Before | After |
+|---|---|---|
+| `pop()` total | 50.5% | 3.8% |
+| `stats()` | 31.7% | gone |
+| `_active_downloads` | 20.4% | gone |
+| `_next_slot` | 10.6% | gone |
+| `parse` | 5.1% | 21.7% |
+| `_extract_links` | 4.9% | 20.9% |
+
+And in the crawl itself:
+
+| Metric | 2h run | 10 min run after the fix |
+|---|---|---|
+| pages/s | 23.0 | 37.6 |
+| reactor lag p50 | 1,200-2,000 ms | 15-430 ms |
+
+The reactor thread is still near saturation, but the expensive work is now
+link extraction and parsing, which is work the crawl actually needs. Reactor
+lag falling by an order of magnitude is the direct evidence that `pop()` was
+what the loop had been spending its time on.
+
+One caveat worth recording: `pop()` must never return `None` while queues hold
+requests. `Scheduler.has_pending_requests()` answers from `__len__`, so a
+`None` there would make the engine call `next_request()` on every heartbeat
+and get nothing, forever. `tests/test_pqueue.py` checks that with every domain
+busy and a scan limit of 2. Five of its six checks also pass against the
+parent class, which is what makes them evidence that the semantics were
+preserved rather than merely self-consistent.
+
 `DEPTH_PRIORITY` was also removed here. `_next_slot` chooses purely by active
 download count and never reads request priority, so it could not affect which
 domain was visited next. Its only measurable effect was splitting each

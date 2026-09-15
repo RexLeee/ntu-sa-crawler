@@ -159,8 +159,9 @@ follow_meta_refresh = false
 # only help if the link stops being the bottleneck.
 #
 # Above 1, every limit in [memory] is per process, so size them for one
-# shard's share and watch total RSS against the 9.9 GB the VM has. Four shards
-# measured 4.0 GB.
+# shard's share and watch total RSS against the 4 GB the e2-medium has. Four
+# shards measured 4.0 GB together, which no longer fits at all: another reason
+# this stays 1.
 shards = 1
 # How often each process drains the URLs other shards handed it. The poll is a
 # few file reads, and a URL waiting here is a domain not yet being crawled, so
@@ -226,10 +227,16 @@ bloom_error_rate = 1e-6
 # unseen domain. That is the one thing we cannot afford to drop, so
 # CappedScheduler now exempts it as well.
 frontier_max_size = 20_000_000
-# Hard stop well under the 9.7 GB the WSL VM has. Per process: at 4 shards
-# this has to come down to about 1800, since four measured 4.0 GB together.
-memusage_limit_mb = 7000
-memusage_warning_mb = 5500
+# Hard stop below the 4 GB the e2-medium has. It has to stay below physical
+# RAM or it is not a guard at all: at 7000, sized for a 10 GB WSL VM, the OOM
+# killer would SIGKILL the process before Scrapy's MemoryUsage extension
+# noticed, losing the log flush and the persisted dupefilter. 2800 is 1.9x the
+# 1,468 MB one process measured, and leaves ~700 MB for the kernel, the page
+# cache and the JOBDIR write path.
+memusage_limit_mb = 2800
+# 600 MB of runway below the limit. RSS grew 1.6 MB/s in the measured hour, so
+# the warning lands in runstats about six minutes before the hard stop.
+memusage_warning_mb = 2200
 # Scrapy keeps every robots.txt parser it ever builds, keyed by hostname, and
 # never evicts. Measured: 0.9 KB for a one-rule file, 7.1 KB for a typical
 # one, 369 KB for a 500-rule one. That dict was the main driver of the

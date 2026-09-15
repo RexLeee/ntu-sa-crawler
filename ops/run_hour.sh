@@ -19,9 +19,14 @@ export PATH="$HOME/.local/bin:$PATH"
 # The soft limit is 1024. Each (domain, priority) pair in the frontier is a
 # FifoDiskQueue holding two open files, head and tail, so descriptors track
 # the frontier's shape rather than the number of live connections: a measured
-# run reached 7,569 queues and 15,422 descriptors. The hard limit is
-# 1,048,576, so raising this needs no root and no config file.
-ulimit -n 1000000
+# run reached 7,569 queues and 15,422 descriptors. Raising the soft limit to
+# the hard limit needs no root and no config file.
+#
+# Take the hard limit rather than a fixed number: it was 1,048,576 on WSL but
+# pam_limits sets it per host, and under `set -e` a bare `ulimit -n 1000000`
+# would abort the run before the first page if the ceiling were lower.
+FD_HARD=$(ulimit -Hn)
+ulimit -n "$FD_HARD" 2>/dev/null || true
 
 # glibc raises its mmap threshold dynamically as a program frees large blocks,
 # after which page bodies of a few hundred KB are served from the heap and
@@ -30,6 +35,15 @@ ulimit -n 1000000
 # whether it worked: flat object counts against rising RSS mean fragmentation.
 export MALLOC_ARENA_MAX=2
 export MALLOC_MMAP_THRESHOLD_=131072
+
+# tldextract fetches the Public Suffix List on first use, and crawler/slot.py
+# calls it from the reactor thread on the first dispatch: a blocking HTTP
+# request inside the event loop, with a silent fallback to the bundled snapshot
+# if it fails. The snapshot and the live list can disagree about private
+# suffixes, and slot_key() is the rate-limit unit, so that would change which
+# hosts share a 5 second timer. Pin the cache so every run keys domains the
+# same way. ops/GCP_SETUP.md populates it once, before the first crawl.
+export TLDEXTRACT_CACHE="${TLDEXTRACT_CACHE:-$PWD/state/tldextract}"
 
 DURATION="${1:-3600}"
 SEEDS="${2:-seeds/seeds_1000.txt}"

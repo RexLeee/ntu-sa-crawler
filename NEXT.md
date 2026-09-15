@@ -1,164 +1,113 @@
 # 現在的狀態，以及接下來做什麼
 
-寫於 2026-09-15 15:40。機制說明在 `README.md`，每個改動的理由在 commit
+寫於 2026-09-15 16:50。機制說明在 `README.md`，每個改動的理由在 commit
 message 裡，**這裡不重複**。
 
 ## 一句話
 
-pop 的 CPU 問題解決了。politeness 還剩一個未確認根因的違規，正在用生產環境
-追蹤抓它。多核心要等 politeness 確定乾淨之後才動。
+pop 的 CPU 問題和 politeness 違規都修好了。下一步是多核心分片，
+等使用者確認 politeness 乾淨之後才開始。
 
 ## pop 已經修好並驗證（`fb67eba`）
 
 `crawler/pqueue.py` 的 `RingDownloaderAwarePriorityQueue` 取代了
 Scrapy 的 `DownloaderAwarePriorityQueue`。選擇規則沒變，只是不再每次掃全部網域。
 
-profile 比對，同一台機器同樣設定：
-
 | 項目 | 修前 | 修後 |
 |---|---|---|
 | `pop` 總時間 | 50.5% | **3.8%** |
 | `stats` | 31.7% | 消失 |
 | `_active_downloads` | 20.4% | 消失 |
-| `_next_slot` | 10.6% | 消失 |
 | `parse` | 5.1% | 21.7% |
-| `_extract_links` | 4.9% | 20.9% |
+| pages/s | 23.0 | **51.7** |
+| reactor 延遲 p50 | 1,200–2,000 ms | **1–58 ms** |
 
-跑測層級：
+**瓶頸換人了。** 現在最貴的是 `parse` 和 `_extract_links`，合計約 42%。
+那是爬蟲真正需要做的工作，所以單 process 已經沒有便宜的空間。
 
-| 項目 | 2 小時跑測 | 修後 10 分鐘 |
-|---|---|---|
-| pages/s | 23.0 | **37.6** |
-| reactor 延遲 p50 | 1,200–2,000 ms | **15–430 ms** |
-| 主執行緒 CPU | 99% | 91–99% |
+## politeness 已經修好（`6093310`）
 
-延遲降一個數量級，是 pop 讓出 CPU 最直接的證據。
+### 症狀與根因
 
-**瓶頸換人了。** 現在最貴的是 `parse` 和 `_extract_links`，合計 21.7%。
-那是爬蟲真正需要做的工作，不是浪費。
+10 分鐘跑測 32,000 個請求：`verify_politeness.py` 報 6 次違規，
+但派送當下的追蹤器**一個字都沒寫**。
 
-## politeness：一個違規，根因未確認
+這兩件事同時成立只有一種解釋：計時器確實把每一對隔開了 5 秒，
+**但它分錯組了**。
 
-10 分鐘跑測，22,000 個請求裡 1 次：
+違規的 URL 都不在 `discovered.log.gz` 裡，代表 spider 從沒 yield 過它們。
+它們是 `MetaRefreshMiddleware` 造出來的。那個中介層和 `RedirectMiddleware`
+共用 `_build_redirect_request`，用 `source_request.replace()` 整份複製 meta，
+所以目標請求帶著**來源網域**的 `download_slot`：
 
 ```
-panasonic.jp   gap=0.000s
+av.jpn.support.panasonic.com  ->  panasonic.jp
+www.home-assistant.io         ->  www.openhomefoundation.org
 ```
 
-兩個 URL 同一毫秒派送。該網域前面安靜了 116 秒。robots 是 0 違規。
+兩個來源頁都用 curl 確認過，都是 200 加上 `<meta http-equiv="refresh">`。
 
-### 已排除的八個假設
+### 為什麼上一次的修法沒擋住
 
-每一個都用真實的 `crawler/dispatch.py` 寫了重現腳本，全部得到正確的 5 秒間隔：
+`RedirectMiddleware` 早就被改成會重設 slot（README 有一節寫這個）。
+**那個修法治的是症狀。** 它只修好一條路，下一條複製 meta 的路就把同樣的
+bug 帶回來。而「會複製 meta 的路」沒有一份會保持完整的清單。
 
-slot 回收後 `id()` 重用（這是上次修好的 bug，已改用網域字串）、事件迴圈阻塞、
-第三個請求覆蓋兄弟預約、轉址繼承 meta、robots.txt 抓取路徑、10 萬筆清除掃描、
-seed 注入、共用 meta dict。
+### 修法：身分不要存，一律從 URL 算
 
-`Downloader._download` 只有一個呼叫點，所以兩個請求都確實經過了計時器。
+`crawler/downloader.py` 的 `DomainSlotDownloader.get_slot_key` 從 URL 算，
+那是每個下載都會經過的唯一一點，用的是 `verify_politeness.py` 同一個
+`slot_key()`。計時器和驗證器不可能再分歧，而且沒有存起來的值就沒有東西可以繼承。
 
-### 已經做的（`074c4dc`、`a4c819d`）
+`dispatch.py` 同理，不再讀 meta。`SlotKeyMiddleware` 因此多餘，已刪除。
+spider、robots、redirect 三處寫 meta 的地方一併刪掉。
 
-**1. 預約只能往前走。** 第二次寫入原本無條件覆蓋：
+### 順帶修掉的第二個缺陷
 
-```python
-next_allowed[slot_id] = dispatched + min_gap          # 舊
-next_allowed[slot_id] = max(next_allowed.get(slot_id, 0.0),
-                            dispatched + min_gap)      # 新
-```
-
-協程睡著時，兄弟可能已經預約了更晚的時段。舊的寫法會用較小的值蓋掉它，
-下一個到達的請求就拿到兄弟正在睡的那個時段。
-
-**這是真實的危險，但無法證明它就是觀察到那一對的原因。**
-
-**2. 生產環境追蹤。** `config.toml` 的 `trace_short_gaps = true`。
-任何低於下限的派送對會把完整狀態寫進 `data/violation-trace.log`：
-兩個 URL、預約與實際時間、字典值、slot 物件的 id / delay / lastseen /
-active / transferring / queue、slot 是否還是活的、meta、完整堆疊。
-
-每次派送兩個 dict 操作，只在間隔過短時寫，48 小時都可以開著。
-
-**3. 回歸測試。** `tests/test_dispatch.py` 第四個情境直接斷言不變量：
-字典裡的值不曾下降。輸掉競態的交錯依賴事件迴圈時序，測試無法可靠重現，
-所以測性質不測 staged 失敗。
-
-### 現在在跑
-
-`data/run-20260915-153104`，15:31 開始的 10 分鐘帶追蹤跑測。
-
-| 結果 | 下一步 |
-|---|---|
-| 0 違規、trace 空 | 再跑一次 10 分鐘確認，然後 1 小時 |
-| 0 違規、trace 有紀錄 | 讀 trace 確認機制，寫進 README |
-| 仍有違規 | 照 trace 的堆疊修 |
-
-## 新增的量測欄位
-
-`runstats.tsv` 多了 `requests`、`responses`、`exceptions` 三欄。
-例外率原本只存在於 stats dump，而 SIGKILL 結束的跑測不會寫那份。
-
-已經有用：這次跑測第 151 秒例外率 83.7%。對照上一次同期 102%
-（例外數超過請求數，因為 robots 拒絕與重試各自計數）。
-**這是既有問題，不是 pop 修改造成的，而且比以前好。**
+meta refresh 也繼承了 `dont_filter`。spider 對已經過 bloom 的請求設這個旗標，
+所以 meta refresh 的目標**跳過了去重**。上一次跑測有 414 個 URL 被抓超過一次，
+浪費 504 次抓取。`ops/verify_no_refetch.py` 現在會抓這個，
+`config.toml` 的 `follow_meta_refresh = false` 把這條路關掉。
 
 ## 還沒做的
 
-**1. 確認 politeness 乾淨。** 最優先。上面在跑。
+**1. 多核心分片。** 計畫已寫好，等使用者確認 politeness 之後開始。
+`crawler/spiders/broad.py` 已有 `shard` / `shards` / `_shard_of()`，沒有東西在用。
 
-**2. 多核心分片。** 等 politeness 確認之後規劃。
-`crawler/spiders/broad.py` 已有 `shard` / `shards` 參數和 `_shard_of()`，
-沒有東西在用。每個網域只屬於一個 shard，所以計時器不跨 process，
-這是分片安全的根本原因。
+關鍵是**跨片 URL 必須交接**，不能像現在直接丟掉。broad crawl 的新網域幾乎
+全靠跨網域連結發現，丟掉會讓每片的活躍網域數掉回單 process 的水準。
 
-**先把單 process 的合規做對，再乘以 N。** 分片會把任何殘留的競態乘以 N 倍。
+**N 由記憶體決定。** 每片約 1.2–1.5 GB，WSL2 有 9.9 GB。**先開 4 量一次再決定**，
+不要直接開 8。`[memory]` 的每個上限都要除以 N。
 
-**3. 例外率 84%。** 需要獨立調查。大部分可能是 robots 嚴格模式的拒絕，
+**2. 例外率 84%。** 需要獨立調查。大部分可能是 robots 嚴格模式的刻意拒絕，
 那是刻意的行為，不是故障。要先把例外分類才知道。
 
-**4. Windows Update 還沒暫停。** 沒有命令列做法，要使用者手動到
+**3. Windows Update 還沒暫停。** 沒有命令列做法，要使用者手動到
 設定 → Windows Update → 進階選項，暫停到 9/20 之後。更新會自動重開機。
 
-**5. 報告本身。** 素材在 `README.md`，還沒動筆。9/19 23:59 寄到
+**4. 報告本身。** 素材在 `README.md`，還沒動筆。9/19 23:59 寄到
 huang.Taiyi@gmail.com。
 
-**6. 48 小時正式跑測。** 9/17 00:00 前要開跑。開跑時間是使用者的決定。
+**5. 48 小時正式跑測。** 9/17 00:00 前要開跑。開跑時間是使用者的決定。
 
-**7. 跑完 48 小時要還原睡眠設定**：`powercfg /change standby-timeout-ac 30`。
+**6. 跑完 48 小時要還原睡眠設定**：`powercfg /change standby-timeout-ac 30`。
 
 ## 測試
 
-28 個檢查，兩台機器都跑過：
+30 個檢查，兩台機器都跑過：
 
 ```bash
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
-uv run python tests/test_dispatch.py      # 4 個情境
-uv run python tests/test_pqueue.py        # 6 個檢查
+uv run python tests/test_dispatch.py      # 5 個情境
+uv run python tests/test_pqueue.py        # 7 個檢查
 uv run python tests/test_scheduler.py     # 5 個檢查
 uv run python tests/test_robots_cache.py  # 7 個檢查
 uv run python tests/test_dupefilter.py    # 6 個檢查
 uvx ruff check crawler/ tests/ ops/
 ```
 
-`tests/test_pqueue.py --parent` 會對 Scrapy 的原類別跑同一批行為檢查，
-五個都通過。這證明新類別保留了語意，不是自說自話。
-
-## 抓 profile
-
-```bash
-export PATH=$HOME/.local/bin:$PATH
-PID=$(pgrep -f "venv/bin/python.*scrapy crawl" | head -1)
-sudo $HOME/.local/bin/py-spy record -p $PID -d 45 -r 100 -f speedscope -o /tmp/prof.speedscope
-```
-
-⚠️ `pgrep -f "bin/scrapy crawl"` 會抓到 `uv run` 的包裝程序，py-spy 對它會報
-「Failed to find python version」。要用上面那個比較精確的樣式。
-
-⚠️ **用 pattern 判斷跑測是否結束會騙人。** 你自己的檢查指令的命令列裡
-也含有那個 pattern，`pgrep` 會匹配到自己。用 `kill -0 <pid>` 比較可靠。
-`ops/run_hour.sh` 本身是記錄 pid 的，沒有這個問題。
-
-⚠️ `-r 250` 會讓 py-spy 跟不上，用 100 以下。
+`tests/test_pqueue.py --parent` 會對 Scrapy 的原類別跑同一批行為檢查。
 
 ## 驗收
 
@@ -166,13 +115,26 @@ sudo $HOME/.local/bin/py-spy record -p $PID -d 45 -r 100 -f speedscope -o /tmp/p
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
 uv run python ops/verify_politeness.py    # 必須 VIOLATIONS : 0
 uv run python ops/verify_robots.py        # 必須 VIOLATIONS : 0
+uv run python ops/verify_no_refetch.py    # 必須 REPEATS : 0
 uv run python ops/report_metrics.py
-uv run python ops/report_growth.py data/run-<stamp>
 ```
+
+還要看 `data/violation-trace.log`。**它現在必須是 0 bytes。**
+以前它和驗證器分組方式不同，所以空的不代表沒問題；現在兩邊同一個定義，
+裡面有東西就是真的違規。
 
 **politeness 不可妥協。** 作業寫「NO violation」。`verify_politeness.py`
 比對的是 `required_min_gap`（5.0），不是 `download_delay`（5.1），
 所以調參數不會鬆綁測試。
+
+## 跑測的方式
+
+**一律用 tmux 在 leepc 跑。** 使用者可能隨時關掉 Mac。
+
+```bash
+/tmp/wsl_ssh.sh 'tmux new-session -d -s verify -c ~/ntu-sa-crawler \
+  "export PATH=\$HOME/.local/bin:\$PATH; ops/run_hour.sh 600 > /tmp/verify-run.log 2>&1"'
+```
 
 ## 環境
 
@@ -193,15 +155,35 @@ Tailnet 上另外兩台 Ubuntu 主機
 
 GitHub repo 保持 **Private**。
 
-## 三個提醒
+## 抓 profile
+
+```bash
+export PATH=$HOME/.local/bin:$PATH
+PID=$(pgrep -f "venv/bin/python.*scrapy crawl" | head -1)
+sudo $HOME/.local/bin/py-spy record -p $PID -d 45 -r 100 -f speedscope -o /tmp/prof.speedscope
+```
+
+⚠️ `pgrep -f "bin/scrapy crawl"` 會抓到 `uv run` 的包裝程序，py-spy 對它會報
+「Failed to find python version」。要用上面那個比較精確的樣式。
+
+⚠️ **用 pattern 判斷跑測是否結束會騙人。** 你自己的檢查指令的命令列裡
+也含有那個 pattern，`pgrep` 會匹配到自己。用 `kill -0 <pid>` 比較可靠。
+
+⚠️ `-r 250` 會讓 py-spy 跟不上，用 100 以下。
+
+## 四個提醒
 
 **不要相信推論，去量。** 上一輪從延遲推論出 parse 是瓶頸，寫進 README
 當結論，profile 顯示它只佔 5.2%。飽和的系統裡每個症狀都指向所有原因。
 
-**不要只看 exit code。** 已經有四次「成功但沒生效」：`powercfg` 批次指令、
-dupefilter 綁定、第一版的 slot GC 測試、以及 `pgrep` 匹配到自己。
-都是查詢驗證才發現的。
+**負面結果也是證據。** 追蹤器「什麼都沒記錄」而驗證器報六次違規，
+這個矛盾本身就是答案：它直接證明問題不在計時精度，而在分組。
+設計診斷時要想清楚「沒響」代表什麼。
 
-**修 bug 要先證明測試抓得到舊的 bug。** 兩次都這樣做，兩次都發現第一版
-測試是無效的。這次的預約競態無法 staged，所以改成斷言不變量，並在
-commit message 裡寫明這個限制。
+**修在對的那一層。** 上一次在 `RedirectMiddleware` 裡重設 slot，
+那是治症狀，所以 meta refresh 又把同樣的 bug 帶回來。
+會複製 meta 的路沒有完整清單，所以要修的是「不要存身分」這件事本身。
+
+**修 bug 要先證明測試抓得到舊的 bug。** `foreign_meta` 情境對舊程式碼
+兩個斷言都失敗，間隔是 0.001s 對 2.0s 下限。`verify_no_refetch.py` 也對
+舊資料驗證過，抓到 414 個重複 URL。

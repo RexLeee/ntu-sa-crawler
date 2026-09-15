@@ -586,6 +586,16 @@ is the tell: the crawl is limited by how many connections this link and
 resolver will carry, not by how much CPU is available to start them. Adding
 processes only added requests that time out.
 
+**Read the pages/s column with care.** A later single-process run under
+identical code and config reached 68.16 pages/s, 25% above the 54.54 baseline,
+purely because only 390 of the 1,000 seed domains came up that time against
+622 in the baseline. Fewer live seeds means fewer links, fewer domains, and a
+budget spent going deeper into a narrow set: that run touched 1,031 domains
+against 2,229. Ten minute samples vary by more than the differences being
+measured here, so the 52.29-against-54.54 gap is inside the noise. The
+conclusion above rests on the TCP and DNS columns, which are structural and
+agree across every run, not on pages/s.
+
 The CPU column is the confirmation. After sharding no process is near
 saturation, so the reactor thread was never what capped the previous run
 either. It looked like the cap because `pop()` really had been burning it, and

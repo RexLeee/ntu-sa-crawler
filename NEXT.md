@@ -1,250 +1,189 @@
-# 現在在跑什麼，以及接下來做什麼
+# 現在的狀態，以及接下來做什麼
 
-寫於 2026-09-15 12:15，在 leepc 上。這份檔案給接手的 Claude Code session。
-主要的機制說明在 `README.md`，改動的理由在 commit message 裡，**這裡不重複**。
+寫於 2026-09-15 15:40。機制說明在 `README.md`，每個改動的理由在 commit
+message 裡，**這裡不重複**。
 
-## 現在的狀態
+## 一句話
 
-2 小時測試正在 tmux session `crawl` 裡跑。
+pop 的 CPU 問題解決了。politeness 還剩一個未確認根因的違規，正在用生產環境
+追蹤抓它。多核心要等 politeness 確定乾淨之後才動。
+
+## pop 已經修好並驗證（`fb67eba`）
+
+`crawler/pqueue.py` 的 `RingDownloaderAwarePriorityQueue` 取代了
+Scrapy 的 `DownloaderAwarePriorityQueue`。選擇規則沒變，只是不再每次掃全部網域。
+
+profile 比對，同一台機器同樣設定：
+
+| 項目 | 修前 | 修後 |
+|---|---|---|
+| `pop` 總時間 | 50.5% | **3.8%** |
+| `stats` | 31.7% | 消失 |
+| `_active_downloads` | 20.4% | 消失 |
+| `_next_slot` | 10.6% | 消失 |
+| `parse` | 5.1% | 21.7% |
+| `_extract_links` | 4.9% | 20.9% |
+
+跑測層級：
+
+| 項目 | 2 小時跑測 | 修後 10 分鐘 |
+|---|---|---|
+| pages/s | 23.0 | **37.6** |
+| reactor 延遲 p50 | 1,200–2,000 ms | **15–430 ms** |
+| 主執行緒 CPU | 99% | 91–99% |
+
+延遲降一個數量級，是 pop 讓出 CPU 最直接的證據。
+
+**瓶頸換人了。** 現在最貴的是 `parse` 和 `_extract_links`，合計 21.7%。
+那是爬蟲真正需要做的工作，不是浪費。
+
+## politeness：一個違規，根因未確認
+
+10 分鐘跑測，22,000 個請求裡 1 次：
 
 ```
-tmux attach -t crawl
+panasonic.jp   gap=0.000s
 ```
 
-| window | 內容 |
+兩個 URL 同一毫秒派送。該網域前面安靜了 116 秒。robots 是 0 違規。
+
+### 已排除的八個假設
+
+每一個都用真實的 `crawler/dispatch.py` 寫了重現腳本，全部得到正確的 5 秒間隔：
+
+slot 回收後 `id()` 重用（這是上次修好的 bug，已改用網域字串）、事件迴圈阻塞、
+第三個請求覆蓋兄弟預約、轉址繼承 meta、robots.txt 抓取路徑、10 萬筆清除掃描、
+seed 注入、共用 meta dict。
+
+`Downloader._download` 只有一個呼叫點，所以兩個請求都確實經過了計時器。
+
+### 已經做的（`074c4dc`、`a4c819d`）
+
+**1. 預約只能往前走。** 第二次寫入原本無條件覆蓋：
+
+```python
+next_allowed[slot_id] = dispatched + min_gap          # 舊
+next_allowed[slot_id] = max(next_allowed.get(slot_id, 0.0),
+                            dispatched + min_gap)      # 新
+```
+
+協程睡著時，兄弟可能已經預約了更晚的時段。舊的寫法會用較小的值蓋掉它，
+下一個到達的請求就拿到兄弟正在睡的那個時段。
+
+**這是真實的危險，但無法證明它就是觀察到那一對的原因。**
+
+**2. 生產環境追蹤。** `config.toml` 的 `trace_short_gaps = true`。
+任何低於下限的派送對會把完整狀態寫進 `data/violation-trace.log`：
+兩個 URL、預約與實際時間、字典值、slot 物件的 id / delay / lastseen /
+active / transferring / queue、slot 是否還是活的、meta、完整堆疊。
+
+每次派送兩個 dict 操作，只在間隔過短時寫，48 小時都可以開著。
+
+**3. 回歸測試。** `tests/test_dispatch.py` 第四個情境直接斷言不變量：
+字典裡的值不曾下降。輸掉競態的交錯依賴事件迴圈時序，測試無法可靠重現，
+所以測性質不測 staged 失敗。
+
+### 現在在跑
+
+`data/run-20260915-153104`，15:31 開始的 10 分鐘帶追蹤跑測。
+
+| 結果 | 下一步 |
 |---|---|
-| `run` | `ops/run_hour.sh 7200`，跑測本體 |
-| `claude` | 空的，給你開 Claude Code |
-| `watch` | 每 30 秒刷新 `data/runstats.tsv` |
+| 0 違規、trace 空 | 再跑一次 10 分鐘確認，然後 1 小時 |
+| 0 違規、trace 有紀錄 | 讀 trace 確認機制，寫進 README |
+| 仍有違規 | 照 trace 的堆疊修 |
 
-跑測目錄是 `data/run-20260915-121243`，12:12:44 開始，14:12 左右結束。
+## 新增的量測欄位
 
-**離開 tmux 用 `Ctrl-b d`，不要用 `Ctrl-c`。** `Ctrl-c` 會殺掉跑測。
+`runstats.tsv` 多了 `requests`、`responses`、`exceptions` 三欄。
+例外率原本只存在於 stats dump，而 SIGKILL 結束的跑測不會寫那份。
 
-## 第一個問題已經有答案了
+已經有用：這次跑測第 151 秒例外率 83.7%。對照上一次同期 102%
+（例外數超過請求數，因為 robots 拒絕與重試各自計數）。
+**這是既有問題，不是 pop 修改造成的，而且比以前好。**
 
-上一輪的計畫要 2 小時測試回答「單一 reactor 執行緒是不是天花板」。
-開跑 2 分鐘就確認了：
+## 還沒做的
 
-| elapsed | proc_cpu | main_cpu | lag_max | frontier | pqueues |
-|---|---|---|---|---|---|
-| 31s | 101.3% | 98.5% | 1,936 ms | 31,213 | 1,285 |
-| 60s | 99.0% | 97.5% | 1,759 ms | 78,622 | 2,350 |
-| 151s | 97.1% | 95.0% | 1,774 ms | 146,500 | 1,863 |
+**1. 確認 politeness 乾淨。** 最優先。上面在跑。
 
-**主執行緒 95–98%，整個程序也只有 99%。8 核用 1 核。**
-reactor 延遲最大 1.9 秒，事件迴圈確實塞住了。
+**2. 多核心分片。** 等 politeness 確認之後規劃。
+`crawler/spiders/broad.py` 已有 `shard` / `shards` 參數和 `_shard_of()`，
+沒有東西在用。每個網域只屬於一個 shard，所以計時器不跨 process，
+這是分片安全的根本原因。
 
-所以 `README.md` 裡「reactor thread is the fourth ceiling」那一節的推論成立，
-而且是直接量到的，不再是推論。
+**先把單 process 的合規做對，再乘以 N。** 分片會把任何殘留的競態乘以 N 倍。
 
-## ⚠️ 跑測中途發現的 bug，已修但跑測沒吃到
+**3. 例外率 84%。** 需要獨立調查。大部分可能是 robots 嚴格模式的拒絕，
+那是刻意的行為，不是故障。要先把例外分類才知道。
 
-`38f179c` 修了一個靜默的 bug。**正在跑的這次測試是在修正前啟動的，所以
-它的吞吐量數字偏低。**
+**4. Windows Update 還沒暫停。** 沒有命令列做法，要使用者手動到
+設定 → Windows Update → 進階選項，暫停到 9/20 之後。更新會自動重開機。
 
-Bug：spider 在自己的 `from_crawler` 裡讀 `crawler.bloom_dupefilter`，
-但 `Crawler.crawl` 先建 spider、後建 engine，而 dupefilter 是 engine
-建 scheduler 時才產生的。所以那個屬性當下不存在，`spider.dupefilter`
-被設成 `None`。
+**5. 報告本身。** 素材在 `README.md`，還沒動筆。9/19 23:59 寄到
+huang.Taiyi@gmail.com。
 
-**沒有任何東西壞掉。** scheduler 還是會過濾重複，爬取結果完全正確。
-只是「先查 bloom 再建 Request」這個最佳化整個沒生效，白做了它要省的工。
-唯一的症狀是 `dupe_skipped` 一直是 0，對照 `discovered` 已經 768,922。
+**6. 48 小時正式跑測。** 9/17 00:00 前要開跑。開跑時間是使用者的決定。
 
-修法是改在 `spider_opened` 綁定。45 秒的 smoke run 現在會跳過 8,211 個
-Request。`tests/test_dupefilter.py` 多了一個案例，用真實順序建 spider 和
-engine 來驗證綁定。
+**7. 跑完 48 小時要還原睡眠設定**：`powercfg /change standby-timeout-ac 30`。
 
-**所以：**
+## 測試
 
-- 這次跑測的 politeness、robots、記憶體、CPU 數字**都有效**
-- 它的 **pages/s 偏低**，因為每個重複 URL 還是建了 Request
-- 要拿正確的吞吐量，跑完後 `git pull` 再跑一次，或直接接受它是下限
+28 個檢查，兩台機器都跑過：
 
-判斷要不要重跑之前，先看這次的 CPU 數字。主執行緒已經 99%，多 process
-才是主要的槓桿，這個修正是次要的。
+```bash
+export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
+uv run python tests/test_dispatch.py      # 4 個情境
+uv run python tests/test_pqueue.py        # 6 個檢查
+uv run python tests/test_scheduler.py     # 5 個檢查
+uv run python tests/test_robots_cache.py  # 7 個檢查
+uv run python tests/test_dupefilter.py    # 6 個檢查
+uvx ruff check crawler/ tests/ ops/
+```
 
-## ⚠️⚠️ profile 推翻了原本的診斷
-
-14:00 抓到了。`data/profile.svg`，6,035 個樣本。另有一份 speedscope
-在 `/tmp/prof.speedscope`。兩份獨立的 profile 結論一致。
-
-**CPU 不是花在解析頁面上。一半以上花在 scheduler 的 pop。**
-
-| 佔用 | 位置 |
-|---|---|
-| **50.7%** | `_dqpop` → `DownloaderAwarePriorityQueue.pop` |
-| 31.4% | 其中 `pqueues.stats()` |
-| 9.1% | 其中 `_active_downloads` |
-| 6.5% | 其中 `_next_slot` |
-| 11.8% | `_wait_for_download`，真正的下載 |
-| **5.2%** | `parse`，我以為是主因的那個 |
-| 2.2% | fingerprint |
-| 1.1% | `canonicalize_url` |
-| 1.0% | `_maybe_follow` |
-
-`_start_scheduled_requests` 一個 callback 就佔 52.3%。
-
-**所以「天花板五」才是真正的天花板，不是「天花板四」。**
-README 裡「reactor thread is the fourth ceiling」那一節推論對了結果
-（reactor 執行緒飽和，確實 99%），但**推錯了原因**。我以為是 parse 太慢，
-實際上 parse 只有 5.2%。
-
-### 為什麼我推錯
-
-我從「延遲 p50 13.65 秒 > 逾時 10 秒」推論 response 塞在 scraper 佇列。
-這次跑測的 `scraper_queued` 幾乎整場是 0，`scraper_active_kb` 也很低。
-佇列根本沒塞。事件迴圈是被 pop 佔住，所以**每一件事**都變慢，包括
-connect 完成事件的處理，那才是逾時的來源。
-
-上一輪的推算也偏低了。我預估 3,430 個網域時 pop 只佔 2% 的核心。
-實測 `pqueues` 在 5,000 左右，pop 卻佔 50%。差了 25 倍。原因是
-`stats()` 每次 pop 都對**每個** pqueue 建一個 tuple 進 list，我的
-微基準低估了真實的物件配置成本。
-
-### 這改變了下一步的優先順序
-
-**B2（O(1) 的 pop）從「條件性、第二優先」變成第一優先。**
-它是單 process 就能拿到的 2 倍，而且不需要多 process 的複雜度。
-
-多 process 分片仍然有用，但順序要換：**先修 pop，再看還需不需要分片。**
-修完 pop 之後 CPU 的分布會完全不同，那時再量一次才知道下一個瓶頸在哪。
-
-修法：子類化 `DownloaderAwarePriorityQueue`，覆寫 `pop`。
-不要每次都掃全部 slot。用 deque 輪詢，或維護一個「active=0 的 slot」集合。
-`crawler/scheduler.py` 的 `SCHEDULER_PRIORITY_QUEUE` 指過去。
-
-⚠️ 改完一定要重跑 `ops/verify_politeness.py`。pop 決定哪個網域下一個被爬，
-是靠近政策合規的路徑。
-
-## 2 小時跑測的完整結果（14:13 結束）
-
-跑測目錄 `data/run-20260915-121243`。
-
-### 驗收：發現兩類真實違規，都已修好
-
-| 檢查 | 結果 | 狀態 |
-|---|---|---|
-| politeness | **2 違規**，panasonic.jp，間隔 0.001s | `6e323f4` 修好 |
-| robots | **2 違規**，www.eia.gov | `5a77713` 修好 |
-
-**politeness 的原因：** `crawler/dispatch.py` 的計時器字典用 `id(slot)` 當 key。
-Scrapy 的 `_slot_gc` 會回收閒置 60 秒的 slot，而 CPython 立刻重用釋放掉的
-位址（實測 2,000 次配置有 1,999 次重用）。網域安靜一陣子再回來，它的間隔
-紀錄就不見了。兩次違規前的間隔都超過 120 秒，正好夠 slot 被回收重建。
-改成用網域字串當 key。
-
-**robots 的原因：** Scrapy 的 `process_request_2` 在 parser 是 None 時直接
-return，等於「robots.txt 讀不到 = 允許爬全部」。eia.gov 的
-`Disallow: /reports/` 和 `Disallow: /survey` 就這樣被穿過去。改成拒絕。
-失敗的快取 300 秒後過期，否則一次逾時會讓整個網域 48 小時都爬不到。
-
-兩個 bug 都補了會失敗的測試，而且**先驗證過測試真的抓得到舊的 bug**。
-
-### 資源：全部收斂
-
-| 項目 | 結果 |
-|---|---|
-| 記憶體 | 1,366 → 1,443 MB。後 1/3 成長率 **+0.015 MB/s**，等於停了 |
-| 主執行緒 CPU | 99%，整場兩小時 |
-| scrapy.log | **1.1 MB**（上輪同期 495 MB） |
-| fd | 沒撞到上限 |
-
-`objects.log` 很有價值：`_Rule` / `_URLPattern`（robots 規則物件）從
-488,680 降到 74,230。LocalCache 的清除確實在運作，記憶體不是碎片問題。
-
-### Tier 1 指標
-
-| 項目 | 2 小時 | 48 小時外推 |
-|---|---|---|
-| 爬取 | 162,000 | 3,973,596 |
-| 發現（相異） | 1,886,982 | 46,284,589 |
-| 網域數 | 7,361 | 36,961（sqrt 擬合 R² 0.98） |
-| pages/s | 23.0 | — |
-
-**注意 pages/s 偏低。** 這次跑測有 dupefilter 綁定的 bug，而且
-`discovered (raw)` 11,452,000 對 unique 1,886,982，代表重複的 URL 全都
-建了 Request 才被丟掉。修好之後這塊工作會消失。
-
-網域數外推到 36,961，對應的政策上限是 **1,472 pages/s**。所以網域數
-不是瓶頸，CPU 才是。
-
-### pqueues 穩住了，B2 的判斷要修正
-
-`pqueues` 整場在 5,000 左右震盪，沒有往 35,000 跑。
-**但 profile 顯示 pop 仍佔 50.7% 的 CPU。**
-所以 O(1) pop 要做的理由不是「佇列數會長大」，而是「現在就很貴」。
-
-## 剩下要從這次跑測拿到的東西
-
-| 問題 | 看哪裡 | 判準 |
-|---|---|---|
-| 逾時降下來了嗎 | stats dump 的 `downloader/exception_count` | 對比 response_count，要 < 10% |
-| robots 逾時降了嗎 | `robotstxt/exception_count/*DownloadTimeout*` | 上次 89%，要大幅下降 |
-| 去重省掉多少 | `dupefilter/skipped_before_request` | 上次同期 3.3M 個 Request |
-| 記憶體收斂嗎 | `ops/report_growth.py` 的 rate last 1/3 | ≤ 0 |
-| 2.5 GB 是什麼 | `data/objects.log` 前 10 名 vs RSS | 差距大代表是 malloc 碎片 |
-| pop 會不會成為問題 | `runstats.tsv` 的 `pqueues` 欄 | > 10,000 就要做 B2 |
-| 日誌夠安靜嗎 | `ls -la data/run-*/scrapy.log` | 上次 495 MB，要 < 5 MB |
+`tests/test_pqueue.py --parent` 會對 Scrapy 的原類別跑同一批行為檢查，
+五個都通過。這證明新類別保留了語意，不是自說自話。
 
 ## 抓 profile
 
-跑測第 40 分鐘左右（約 12:52）抓一次。這是「每頁 22 ms 花在哪」的唯一直接證據。
-
 ```bash
 export PATH=$HOME/.local/bin:$PATH
-PID=$(pgrep -f "bin/scrapy crawl" | head -1)
-sudo $HOME/.local/bin/py-spy record -p $PID -d 60 -o ~/ntu-sa-crawler/data/profile.svg
+PID=$(pgrep -f "venv/bin/python.*scrapy crawl" | head -1)
+sudo $HOME/.local/bin/py-spy record -p $PID -d 45 -r 100 -f speedscope -o /tmp/prof.speedscope
 ```
 
-`sudo` 是免密碼的。注意 `pgrep` 要抓 python 那個 pid，不是 `uv run` 的父程序。
+⚠️ `pgrep -f "bin/scrapy crawl"` 會抓到 `uv run` 的包裝程序，py-spy 對它會報
+「Failed to find python version」。要用上面那個比較精確的樣式。
 
-## 跑完之後
+⚠️ **用 pattern 判斷跑測是否結束會騙人。** 你自己的檢查指令的命令列裡
+也含有那個 pattern，`pgrep` 會匹配到自己。用 `kill -0 <pid>` 比較可靠。
+`ops/run_hour.sh` 本身是記錄 pid 的，沒有這個問題。
+
+⚠️ `-r 250` 會讓 py-spy 跟不上，用 100 以下。
+
+## 驗收
 
 ```bash
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
 uv run python ops/verify_politeness.py    # 必須 VIOLATIONS : 0
 uv run python ops/verify_robots.py        # 必須 VIOLATIONS : 0
 uv run python ops/report_metrics.py
-uv run python ops/report_growth.py data/run-20260915-121243
+uv run python ops/report_growth.py data/run-<stamp>
 ```
 
-**politeness 是不可妥協的。** 作業寫「NO violation」。任何改動之後都要重跑，
-而且 `verify_politeness.py` 比對的是 `required_min_gap`（5.0），
-不是 `download_delay`（5.1），所以調參數不會鬆綁測試。
+**politeness 不可妥協。** 作業寫「NO violation」。`verify_politeness.py`
+比對的是 `required_min_gap`（5.0），不是 `download_delay`（5.1），
+所以調參數不會鬆綁測試。
 
-## 下一步：多 process 分片
+## 環境
 
-主執行緒已經確認飽和，所以這是唯一能再拉高吞吐量的方向。
-`crawler/spiders/broad.py` 已經有 `shard` / `shards` 參數和 `_shard_of()`，
-但沒有任何東西在用它。
+**leepc**（正式跑的機器）
 
-要點：
-
-- 每個網域只屬於一個 shard，所以 politeness 計時器不跨 process。這是
-  分片安全的根本原因
-- `ops/run_hour.sh` 要起 N 個 `scrapy crawl broad -a shard=i -a shards=N
-  -s JOBDIR=state/job-i`
-- `verify_politeness.py` 和 `report_metrics.py` 已經用 glob 讀
-  `crawled*.log.gz`，合併驗證不用改
-- **N 由記憶體決定**。等這次跑測的 RSS 峰值出來再算。bloom 每 process
-  171 MB 是固定成本
-- 跨 shard 的 URL 先照舊丟掉。Tier 1 的**發現**指標不受影響，因為
-  `discovered_raw` 的累加在 shard 檢查之前
-
-先看完這次跑測的數字再決定 N，不要直接開 8。
-
-## 還沒做的
-
-**Windows Update 還沒暫停。** 沒有命令列做法，要使用者手動到
-設定 → Windows Update → 進階選項，暫停到 9/20 之後。更新會自動重開機，
-那會殺掉 48 小時的正式跑測。
-
-**報告本身。** 素材在 `README.md`，還沒動筆。9/19 23:59 寄到
-huang.Taiyi@gmail.com。
-
-**跑完 48 小時要還原睡眠設定**：`powercfg /change standby-timeout-ac 30`。
+- Tailscale `100.114.150.20`，帳號 `rex`，port 2222
+- 連線用 `/tmp/wsl_ssh.sh`（本機 helper，不在 repo）
+- 非互動 shell 要 `export PATH=$HOME/.local/bin:$PATH`
+- Python 3.14.4，Scrapy 2.19，Ubuntu 26.04，AMD Ryzen 7 3700X 8 核
+- WSL2 配置 10 GB 記憶體、8 核、4 GB swap，磁碟剩 950 GB
+- `sudo` 免密碼，`py-spy` 已裝
 
 ## 安全限制
 
@@ -254,26 +193,15 @@ Tailnet 上另外兩台 Ubuntu 主機
 
 GitHub repo 保持 **Private**。
 
-## 使用者現在不在
+## 三個提醒
 
-使用者出門了，Mac 關機。這個 session 是接手用的。
+**不要相信推論，去量。** 上一輪從延遲推論出 parse 是瓶頸，寫進 README
+當結論，profile 顯示它只佔 5.2%。飽和的系統裡每個症狀都指向所有原因。
 
-**可以自己做的：** 讀資料、跑分析腳本、改程式碼、跑測試、commit。
+**不要只看 exit code。** 已經有四次「成功但沒生效」：`powercfg` 批次指令、
+dupefilter 綁定、第一版的 slot GC 測試、以及 `pgrep` 匹配到自己。
+都是查詢驗證才發現的。
 
-**要等使用者回來才做的：**
-
-- 開始 48 小時正式跑測。開跑時間是他的決定，截止是 9/17 00:00
-- 暫停 Windows Update。沒有命令列做法
-- 任何會刪掉跑測資料的事
-
-跑測 14:12 左右結束。結束後照上面的驗收流程跑完，把結果整理好等他回來。
-如果決定要重跑一次拿正確的吞吐量數字，那是可逆的，可以自己做。
-
-## 兩個提醒
-
-**不要只看 exit code。** 有兩次 exit code 回 0 但實際沒生效：`powercfg`
-的批次指令、以及 seed 探測讀不滿一個 chunk。都是查詢驗證才發現的。
-
-**關閉很慢。** `CONCURRENT_REQUESTS=3000` 時 Scrapy 的優雅關閉要等每個
-停等請求逾時，實測超過 5 分鐘。`ops/run_hour.sh` 已經處理：先複製日誌，
-再 SIGTERM，20 秒後 SIGKILL。
+**修 bug 要先證明測試抓得到舊的 bug。** 兩次都這樣做，兩次都發現第一版
+測試是無效的。這次的預約競態無法 staged，所以改成斷言不變量，並在
+commit message 裡寫明這個限制。

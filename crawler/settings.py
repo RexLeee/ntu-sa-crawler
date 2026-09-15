@@ -50,7 +50,12 @@ SCRAPER_SLOT_MAX_ACTIVE_SIZE = _crawl["scraper_slot_max_active_size"]
 DEPTH_PRIORITY = _crawl["depth_priority"]
 SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
 SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
-SCHEDULER_PRIORITY_QUEUE = "scrapy.pqueues.DownloaderAwarePriorityQueue"
+# DownloaderAwarePriorityQueue picks the next domain by scanning every
+# per-domain queue, which a profile put at 52% of all CPU. The subclass keeps
+# the same selection rule but stops at the first idle domain. See
+# crawler/pqueue.py.
+SCHEDULER_PRIORITY_QUEUE = "crawler.pqueue.RingDownloaderAwarePriorityQueue"
+PQUEUE_SCAN_LIMIT = _crawl["pqueue_scan_limit"]
 # Required by DownloaderAwarePriorityQueue, which raises ValueError otherwise.
 CONCURRENT_REQUESTS_PER_IP = 0
 

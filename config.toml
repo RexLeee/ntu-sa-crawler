@@ -76,6 +76,16 @@ download_maxsize = 524288        # 512 KB; large pages rarely carry more links
 # queue across several priority buckets: 3,430 domains produced 7,569 queue
 # directories and 15,422 open file descriptors, two per queue.
 depth_priority = 0
+# How many domains crawler/pqueue.py may look at before it settles for the
+# least busy one it saw. It normally stops far sooner: it stops at the first
+# domain with no active download, and a skipped domain rotates to the back, so
+# the expected scan is close to 1. The cap only bounds the pathological case
+# where every domain in the ring is busy.
+#
+# Scrapy's own queue scans every domain on every pop. At the ~5,000 per-domain
+# queues this crawl holds, a profile put that at 52% of all CPU against 5% for
+# parse().
+pqueue_scan_limit = 256
 # INFO wrote 474 MB in 28 minutes, which extrapolates to ~48 GB over the full
 # run. Almost all of it is one line per fetch plus a stack trace per failure,
 # and neither is needed: data/crawled.log.gz already records every fetch, and

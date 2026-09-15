@@ -41,7 +41,7 @@ def _scheduler(cap: int = CAP) -> CappedScheduler:
         BroadSpider,
         {
             "FRONTIER_MAX_SIZE": cap,
-            "SCHEDULER_PRIORITY_QUEUE": "scrapy.pqueues.DownloaderAwarePriorityQueue",
+            "SCHEDULER_PRIORITY_QUEUE": "crawler.pqueue.RingDownloaderAwarePriorityQueue",
             "CONCURRENT_REQUESTS_PER_IP": 0,
             "DUPEFILTER_CLASS": "scrapy.dupefilters.BaseDupeFilter",
         },

@@ -65,6 +65,12 @@ COLUMNS = (
     "discovered",
     "dupe_skipped",
     "rss_mb",
+    # The exception rate is the headline health number and it only appears in
+    # the stats dump, which a run killed by SIGKILL never writes. A 2 hour run
+    # ended that way and left the timeout rate unknown.
+    "requests",
+    "responses",
+    "exceptions",
 )
 
 
@@ -236,6 +242,11 @@ class RunStats:
         except Exception:
             dns_cached = 0
 
+        stats = self.crawler.stats
+        requests = stats.get_value("downloader/request_count", 0)
+        responses = stats.get_value("downloader/response_count", 0)
+        exceptions = stats.get_value("downloader/exception_count", 0)
+
         spider = self.crawler.spider
         crawled = getattr(getattr(spider, "crawled_log", None), "count", 0)
         discovered = getattr(getattr(spider, "discovered_log", None), "count", 0)
@@ -262,6 +273,9 @@ class RunStats:
             str(discovered),
             str(dupe_skipped),
             f"{_read_rss_kb() / 1024:.0f}",
+            str(requests),
+            str(responses),
+            str(exceptions),
         )
         self._fh.write("\t".join(row) + "\n")
         self._fh.flush()

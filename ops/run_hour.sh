@@ -42,6 +42,19 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 RUNDIR="data/run-${STAMP}"
 mkdir -p "$RUNDIR"
 
+# Refuse to start on top of a live crawl. A previous supervisor that died
+# without running its trap leaves its workers running, and they keep their
+# JOBDIR open: the cleanup below then fails, and the new run either inherits a
+# half-deleted frontier or dies partway through clearing it. Both happened.
+#
+# Matching on JOBDIR= rather than "scrapy crawl" keeps this from matching the
+# grep itself or an unrelated scrapy process.
+if pgrep -f "JOBDIR=state/job" >/dev/null 2>&1; then
+    echo "a crawl is already running; stop it first:" >&2
+    pgrep -af "JOBDIR=state/job" >&2
+    exit 1
+fi
+
 # Start clean so the metrics describe this run alone.
 rm -f data/crawled*.log.gz data/discovered*.log.gz data/runstats*.tsv data/objects*.log
 # The trace is opened in append mode, so a previous run's contents would be
@@ -51,7 +64,14 @@ rm -f data/crawled*.log.gz data/discovered*.log.gz data/runstats*.tsv data/objec
 rm -f data/violation-trace*.log
 # The handoff inboxes are offsets into append-only files. A stale one would
 # make a worker skip past URLs it never saw, or replay ones it already did.
-rm -rf state/job state/job-* state/handoff
+# `|| true` because a failure here must be reported by the check below rather
+# than killing the script halfway through the deletion.
+rm -rf state/job state/job-* state/handoff || true
+if ls -d state/job state/job-* >/dev/null 2>&1; then
+    echo "could not clear the frontier; something still holds it:" >&2
+    ls -d state/job state/job-* >&2
+    exit 1
+fi
 
 echo "run dir      : $RUNDIR"
 echo "duration     : ${DURATION}s"
@@ -83,7 +103,19 @@ collect() {
     cp data/runstats*.tsv data/objects*.log "$RUNDIR/" 2>/dev/null || true
     cp data/violation-trace*.log "$RUNDIR/" 2>/dev/null || true
 }
-trap collect EXIT INT TERM
+
+# The workers must not outlive this script. A supervisor that dies on an
+# unexpected error used to leave four crawls running, which then held their
+# JOBDIR open and corrupted the next run's frontier. `uv run` is the parent,
+# so its child has to be killed too.
+reap() {
+    local pid
+    for pid in "${PIDS[@]:-}"; do
+        pkill -9 -P "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || true
+    done
+}
+trap 'collect; reap' EXIT INT TERM
 
 # Each crawl runs under `uv run`, so the python process is a child of the
 # recorded pid. Sample the whole tree rather than the launcher.

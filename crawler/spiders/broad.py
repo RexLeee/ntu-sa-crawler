@@ -38,10 +38,8 @@ class BroadSpider(Spider):
         # catches the cases where event-loop congestion would let a pair slip
         # under. See crawler/dispatch.py.
         # The trace records any dispatch pair that lands closer than the floor,
-        # with the slot and timer state that produced it. A 10 minute run put
-        # two panasonic.jp requests at one timestamp and no offline
-        # reproduction could recreate it, so the remaining way to find the
-        # cause is to record it in production. It writes only on a short gap.
+        # with the slot and timer state that produced it. It writes only on a
+        # short gap, so it stays on for the whole run.
         trace = None
         if self.cfg["politeness"].get("trace_short_gaps", False):
             trace = str(data_dir() / "violation-trace.log")
@@ -128,7 +126,7 @@ class BroadSpider(Spider):
             self.queued_per_domain.pop(key, None)
 
     def _on_request_settled(self, request, spider) -> None:
-        self._release_queued(request.meta.get("download_slot") or slot_key(request.url))
+        self._release_queued(slot_key(request.url))
 
     def start_requests(self):
         yield from self._seed_requests()
@@ -153,10 +151,7 @@ class BroadSpider(Spider):
             self.seen_domains.add(key)
             count += 1
             yield Request(
-                url,
-                callback=self.parse,
-                meta={"download_slot": key, "seed": True},
-                dont_filter=False,
+                url, callback=self.parse, meta={"seed": True}, dont_filter=False
             )
         logger.info("loaded %d seeds from %s", count, self.seeds_path)
 
@@ -174,7 +169,7 @@ class BroadSpider(Spider):
     # --- parsing ------------------------------------------------------------
 
     def parse(self, response):
-        key = response.meta.get("download_slot") or slot_key(response.url)
+        key = slot_key(response.url)
         ctype = response.headers.get(b"Content-Type", b"").decode("latin-1", "replace")
 
         body = response.body
@@ -268,7 +263,10 @@ class BroadSpider(Spider):
             self.seen_domains.add(key)
 
         self.queued_per_domain[key] += 1
-        meta = {"download_slot": key}
+        # No download_slot. crawler/downloader.py derives it from the URL, so
+        # putting it in meta would only create a second copy that a request
+        # built from this one could carry to a different domain.
+        meta = {}
         if is_new_domain:
             # CappedScheduler lets this past a full frontier. See its
             # enqueue_request: domain count is what bounds throughput.

@@ -1,32 +1,32 @@
-"""Redirect handling that re-keys the download slot.
+"""Redirect handling that restores duplicate filtering.
 
 Scrapy's RedirectMiddleware builds the follow-up request with
-`source_request.replace(url=...)`, which copies meta wholesale. That carries
-the *original* download_slot to the new URL, so a redirect crossing domains
-(youtube.com -> google.com) lands on the source domain's timer and bypasses
-the target's rate limit entirely.
+`source_request.replace(url=...)`, which copies the source's attributes
+wholesale. Two of them must not travel to a different URL.
 
-Observed in a 10 minute run: two developer.google.com requests dispatched at
-the identical timestamp because both arrived via redirects from other hosts.
+The download slot used to be the dangerous one: a redirect from youtube.com to
+google.com landed on youtube's timer and skipped google's rate limit
+entirely, which a 10 minute run turned into two identically timestamped
+requests to developer.google.com. That is now handled a layer down.
+crawler/downloader.py derives the slot from the URL, so no inherited value can
+reach it and this middleware no longer has to correct one.
+
+dont_filter still has to be corrected here, because nothing else can.
 """
 
 from __future__ import annotations
 
 from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
 
-from crawler.slot import slot_key
-
 
 class SlotAwareRedirectMiddleware(RedirectMiddleware):
-    """Re-assign download_slot whenever a redirect changes the domain."""
+    """Make every redirect target face the duplicate filter."""
 
     def _build_redirect_request(self, source_request, response, *, url: str, **kwargs):
         redirect_request = super()._build_redirect_request(
             source_request, response, url=url, **kwargs
         )
-        # Re-key on the destination, not the source.
-        redirect_request.meta["download_slot"] = slot_key(redirect_request.url)
-        # The spider now sets dont_filter on requests it has already checked
+        # The spider sets dont_filter on requests it has already checked
         # against the Bloom filter, and replace() copies that flag. A redirect
         # target is a different URL that nothing has checked, so restore
         # filtering or a redirect loop between two URLs would never terminate.

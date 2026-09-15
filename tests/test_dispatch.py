@@ -13,6 +13,13 @@ coroutine, not when the coroutine runs, and at high concurrency the event loop
 can be blocked in between. To prove the floor works independently, the second
 test configures a DOWNLOAD_DELAY *below* the floor and checks the gaps still
 come out above it.
+
+The fourth scenario covers the other way a gap can collapse: the requests are
+correctly spaced, but grouped under the wrong domain. A request built by
+MetaRefreshMiddleware carries a copy of the *source* page's meta, including
+its download_slot, so it queues on the source domain's timer and ignores the
+target's. Sending four requests to one host under four different foreign slot
+keys reproduces that.
 """
 
 from __future__ import annotations
@@ -43,13 +50,17 @@ TOLERANCE = 0.05
 # (measured: 1,999 reuses in 2,000 allocations), so a domain that went quiet
 # and came back lost its gap entirely: two requests to panasonic.jp dispatched
 # 0.001s apart. Here the slot is collected between every request.
+# Scenario 4 reproduces the meta refresh violation. See _foreign_meta below.
 SCENARIOS = {
     "measure": {"delay": 2.0, "floor": 0.0, "expect": 2.0},
     "enforce": {"delay": 0.5, "floor": 2.0, "expect": 2.0},
     "slot_gc": {"delay": 0.0, "floor": 2.0, "expect": 2.0, "gc_slots": True},
+    "foreign_meta": {"delay": 0.0, "floor": 2.0, "expect": 2.0, "foreign_meta": True},
 }
 
 observed: list[float] = []
+# The slot each request actually landed on, as the Downloader resolved it.
+resolved_slots: list[str] = []
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -85,10 +96,15 @@ class _Spider(Spider):
     # domain whose next URL is discovered only after the previous page parses.
     chained = False
 
+    # Give every request a different, wrong download_slot, as a request
+    # manufactured by a meta refresh from another site arrives with.
+    foreign_meta = False
+
     def _probe(self, i: int) -> Request:
+        slot = f"foreign{i}.example" if self.foreign_meta else "probe"
         return Request(
             f"http://127.0.0.1:{self.port}/?i={i}",
-            meta={"download_slot": "probe", "i": i},
+            meta={"download_slot": slot, "i": i},
             dont_filter=True,
             callback=self.parse,
         )
@@ -102,6 +118,9 @@ class _Spider(Spider):
 
     def parse(self, response):
         observed.append(float(response.meta[DISPATCH_TIME]))
+        # _enqueue_request writes the key the Downloader chose back into meta,
+        # so this is what the rate limiter actually grouped the request under.
+        resolved_slots.append(response.meta.get("download_slot", ""))
         if self.chained:
             nxt = response.meta["i"] + 1
             if nxt < REQUESTS:
@@ -160,8 +179,16 @@ def run_scenario(name: str) -> int:
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    process = CrawlerProcess(settings={"LOG_LEVEL": "ERROR", "DOWNLOAD_DELAY": cfg["delay"]})
+    settings = {"LOG_LEVEL": "ERROR", "DOWNLOAD_DELAY": cfg["delay"]}
+    if cfg.get("foreign_meta"):
+        # The floor alone is not enough. A request carrying a foreign slot key
+        # would still occupy the wrong Scrapy slot, so both halves of the fix
+        # have to be in place for the gaps to hold.
+        settings["DOWNLOADER"] = "crawler.downloader.DomainSlotDownloader"
+
+    process = CrawlerProcess(settings=settings)
     _Spider.chained = bool(cfg.get("gc_slots"))
+    _Spider.foreign_meta = bool(cfg.get("foreign_meta"))
     process.crawl(_Spider, port=port)
     process.start()
     server.shutdown()
@@ -170,6 +197,19 @@ def run_scenario(name: str) -> int:
     if len(observed) != REQUESTS:
         print(f"FAIL [{name}]: expected {REQUESTS} dispatches, got {len(observed)}")
         return 1
+
+    if cfg.get("foreign_meta"):
+        # Every probe is the same host, so one key must cover all four. The
+        # gap check below would also pass if the timer simply got lucky, so
+        # assert the grouping directly.
+        wrong = [s for s in resolved_slots if s != "127.0.0.1"]
+        if wrong:
+            print(
+                f"FAIL [{name}]: {len(wrong)} request(s) kept a foreign slot key, "
+                f"e.g. {wrong[0]!r}; expected '127.0.0.1'"
+            )
+            return 1
+        print(f"[{name}] all {len(resolved_slots)} requests resolved to '127.0.0.1'")
 
     gaps = [b - a for a, b in zip(observed, observed[1:], strict=False)]
     expect = cfg["expect"]

@@ -31,12 +31,25 @@ Python sources.
 
 ## How politeness is enforced
 
-### The domain is the eTLD+1
+### The domain is the eTLD+1, and it is always derived from the URL
 
-`crawler/slot.py` maps every URL to its registered domain and puts it in
-`meta['download_slot']`. Scrapy keys download slots by hostname by default,
-which would let `en.wikipedia.org` and `simple.wikipedia.org` each run their
-own 5 second timer and double the real request rate against one site.
+`crawler/slot.py` maps every URL to its registered domain. Scrapy keys download
+slots by hostname by default, which would let `en.wikipedia.org` and
+`simple.wikipedia.org` each run their own 5 second timer and double the real
+request rate against one site.
+
+`crawler/downloader.py` overrides `get_slot_key` so the key is computed from
+the URL every time. The alternative, which this project used first, is to put
+the key in `meta['download_slot']` and let Scrapy read it back. That is what
+Scrapy's own API invites, and it is wrong for the same reason twice over, as
+the section on meta refresh below describes: meta is state that gets copied
+from one request to another, so a key placed there can end up describing a
+domain the request is no longer going to.
+
+Deriving instead of storing removes the whole class of failure. The key is a
+pure function of the URL, so no code path can hand a request a stale identity,
+and it is the same function `ops/verify_politeness.py` groups by. The timer and
+the proof cannot disagree.
 
 PSL private domains are enabled, so `foo.blogspot.com` and `bar.blogspot.com`
 count as separate domains. They are separate sites on shared infrastructure.
@@ -52,9 +65,12 @@ is pinned to 0, and the legacy `RANDOMIZE_DOWNLOAD_DELAY` is set to False.
 Scrapy's `RobotsTxtMiddleware` parses `Crawl-delay` but never applies it
 (scrapy/scrapy#892). `crawler/middlewares/robots.py` subclasses it to:
 
-1. Build the `robots.txt` request with our `download_slot`, so the robots
-   fetch shares the site's timer instead of getting a free one.
-2. Raise the slot delay when a site asks for more than 5 seconds, capped at 60.
+1. Raise the slot delay when a site asks for more than 5 seconds, capped at 60.
+2. Bound the parser cache, which Scrapy never evicts from.
+
+The `robots.txt` fetch shares the site's timer with no work at all, because the
+slot key comes from the URL and `robots.txt` is on the same registered domain
+as the pages it governs.
 
 ## Measuring compliance correctly
 
@@ -131,13 +147,60 @@ Scrapy's `RedirectMiddleware` builds the follow-up request with
 `google.com` lands on youtube's timer and skips google's entirely. That run
 followed 3,110 redirects, which was enough to collide.
 
-`crawler/middlewares/redirect.py` re-keys the slot on the destination URL.
-The re-run reported 0 violations.
+The first fix re-keyed the slot inside `RedirectMiddleware`, on the destination
+URL. The re-run reported 0 violations.
 
 The macOS runs never exposed this. They were too slow to accumulate enough
 cross-domain redirects. The general lesson is that a single `DOWNLOAD_DELAY`
 setting does not deliver politeness on its own: every internal path that
 manufactures a new request has to be audited.
+
+### The same bug came back through meta refresh, and the fix was in the wrong place
+
+That audit missed a path, and patching one middleware is what let it.
+
+A later 10 minute run reported six violations while the in-process trace, which
+records the gap at the moment of dispatch, recorded nothing at all. Those two
+results are only compatible in one way. The timer really did space every pair
+five seconds apart. It was spacing the wrong groups.
+
+The violating rows share a shape:
+
+```
+1789457772.002  https://www.chinadaily.com.cn/china/xismoments
+1789457772.052  https://subsites.chinadaily.com.cn/...     gap 0.050s
+```
+
+Both are `chinadaily.com.cn`, which is what `verify_politeness.py` groups by.
+But `subsites...` never appears in `discovered.log.gz`, so the spider never
+yielded it. It arrived another way. Fetching the pages that did get discovered
+shows how:
+
+```
+av.jpn.support.panasonic.com/...  200  <meta http-equiv="Refresh" content="0;url=https://panasonic.jp/...">
+www.home-assistant.io/blog/...    200  <meta http-equiv="refresh" content="0; url=https://www.openhomefoundation.org/...">
+```
+
+Scrapy enables `MetaRefreshMiddleware` by default, and it shares
+`_build_redirect_request` with the redirect middleware that had already been
+fixed. The target inherited the source page's `download_slot`, so it queued on
+the source domain's timer and ignored the target's.
+
+It also inherited `dont_filter`, which the spider sets on requests it has
+already checked against the Bloom filter. Meta refresh targets therefore
+skipped the duplicate filter: that run fetched dozens of URLs twice.
+
+**The lesson is about where a fix belongs, not about meta refresh.** Correcting
+`download_slot` inside one middleware treats a symptom of an inherited
+identity, and leaves every other path that copies meta still broken. There is
+no list of such paths that stays complete. The fix that holds is to stop
+storing the identity: `crawler/downloader.py` derives the slot key from the URL
+in `get_slot_key`, which is the single point every download passes through.
+Nothing can inherit a value that is never stored.
+
+`config.toml` also sets `follow_meta_refresh = false`. With the downloader fix
+in place a meta refresh would now be compliant, so this is only about not
+fetching the same page twice.
 
 ### The fd limit is the first ceiling, not memory
 
@@ -477,9 +540,12 @@ crawler/dispatch.py               dispatch-time stamping (see above)
 crawler/extract.py                regex href extraction
 crawler/filters.py                canonicalization and trap filtering
 crawler/logwriter.py              gzipped TSV writers
-crawler/middlewares/slot.py       assigns download_slot
+crawler/downloader.py             keys every slot by eTLD+1 of the URL
+crawler/pqueue.py                 O(1) next-domain selection
+crawler/scheduler.py              frontier cap with O(1) size tracking
+crawler/dupefilter.py             Bloom duplicate filter
 crawler/middlewares/robots.py     robots.txt + Crawl-delay
-crawler/middlewares/redirect.py   re-keys the slot across redirects
+crawler/middlewares/redirect.py   restores filtering across redirects
 crawler/spiders/broad.py          the crawler
 ops/verify_politeness.py          proves the rate limit held
 ops/verify_robots.py              proves robots.txt was respected

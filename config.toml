@@ -35,11 +35,13 @@ required_min_gap = 5.0
 download_delay_jitter = 0.0
 concurrent_requests_per_domain = 1
 # Dump the timer and slot state whenever two dispatches on one domain land
-# closer than required_min_gap. A 10 minute run produced exactly one such pair
-# (panasonic.jp, both at the same millisecond) and none of eight offline
-# reproductions could recreate it, so the cause has to be caught in
-# production. The check is two dict operations per dispatch and writes nothing
-# unless a gap is short, so it stays on for the 48 hour run.
+# closer than required_min_gap. This stayed empty through a run that the
+# offline check reported six violations for, and that contradiction is what
+# located the cause: the timer was spacing requests correctly but grouping
+# them by an inherited meta key rather than by the URL's domain. Both now use
+# slot_key(url), so anything written here is a real defect. The check is two
+# dict operations per dispatch and writes nothing unless a gap is short, so it
+# stays on for the 48 hour run.
 trace_short_gaps = true
 obey_robotstxt = true
 # Treat eTLD+1 as the politeness unit. Includes PSL private domains, so
@@ -117,6 +119,14 @@ retry_enabled = false
 cookies_enabled = false
 redirect_enabled = true
 redirect_max_times = 2
+# Scrapy enables meta refresh by default. MetaRefreshMiddleware builds the
+# target with source_request.replace(), which copies meta wholesale: the
+# target inherited the source domain's download_slot and its dont_filter flag.
+# That produced six politeness violations and dozens of double fetches in a 10
+# minute run. crawler/downloader.py now derives the slot from the URL, so this
+# would be compliant either way; off because a broad crawl gains nothing from
+# following a refresh that a normal link would also expose.
+follow_meta_refresh = false
 
 [limits]
 # A single domain can yield at most 34560 pages in 48h anyway (1 per 5s).

@@ -2,12 +2,17 @@
 
 Scrapy's RobotsTxtMiddleware leaves two gaps for a politeness-critical crawl:
 
-1. It builds the robots.txt Request itself without our download_slot, so the
-   fetch lands on a hostname-keyed slot and bypasses the domain timer.
+1. It never evicts a parsed robots.txt, keyed by hostname. That dict was the
+   main driver of a 5.3 GB RSS in an 87 minute run.
 2. It parses Crawl-delay but never applies it (scrapy/scrapy#892). A site
    asking for 10s would still be hit every 5s.
 
-This subclass closes both.
+This subclass closes both, and makes an unreadable robots.txt mean "do not
+crawl" rather than "crawl anything".
+
+The robots.txt fetch shares the domain's rate limit without any work here:
+crawler/downloader.py derives every slot key from the URL, and robots.txt sits
+on the same registered domain as the pages it governs.
 """
 
 from __future__ import annotations
@@ -123,14 +128,13 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
 
         self._inflight[netloc] = Deferred()
         robotsurl = f"{url.scheme}://{netloc}/robots.txt"
+        # No download_slot in meta. crawler/downloader.py derives the slot from
+        # the URL, and robots.txt is on the same registered domain as the pages
+        # it governs, so the fetch already shares their 5s gap.
         robotsreq = Request(
             robotsurl,
             priority=self.DOWNLOAD_PRIORITY,
-            meta={
-                "dont_obey_robotstxt": True,
-                # Share the page slot so robots.txt obeys the same 5s gap.
-                "download_slot": slot_key(robotsurl),
-            },
+            meta={"dont_obey_robotstxt": True},
             callback=NO_CALLBACK,
         )
         try:
@@ -219,8 +223,11 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
             logger.info("Crawl-delay %.1fs applied to slot %s", delay, key)
 
     def process_request_2(self, rp, request: Request) -> None:
-        key = request.meta.get("download_slot")
-        if key and key in self._pending_delays:
+        # Derived, not read from meta. This middleware runs before the
+        # Downloader assigns a slot, so meta may not carry one yet, and an
+        # inherited one would name the wrong domain.
+        key = slot_key(request.url)
+        if key in self._pending_delays:
             self._apply_delay(key, self._pending_delays[key])
 
         # The parent returns silently when rp is None, which treats an

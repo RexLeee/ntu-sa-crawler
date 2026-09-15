@@ -78,12 +78,15 @@ def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
     when it exercises Scrapy's own delay.
 
     When trace_path is set, every dispatch closer than min_gap to the previous
-    one on the same slot is dumped there with the state that produced it. A 10
-    minute run put two panasonic.jp requests at the identical timestamp and
-    none of the offline reproductions could recreate it, so the remaining way
-    to find the cause is to record it as it happens. The check is two dict
-    operations per dispatch and only writes when a gap is short, so it is
-    cheap enough to leave on for the full 48 hours.
+    one on the same slot is dumped there with the state that produced it.
+
+    The trace earned its keep by staying empty. Six violations were reported
+    by the offline check while this recorded nothing, and those two facts
+    together are what identified the cause: the spacing was correct, but the
+    grouping was not, so a violation could not appear here. Now that both use
+    slot_key(url), a short gap written here is a real defect rather than a
+    disagreement about identity. The check is two dict operations per dispatch
+    and only writes when a gap is short, so it stays on for the full 48 hours.
     """
     global _installed
     if _installed:
@@ -97,17 +100,24 @@ def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
     # coroutines entering together get consecutive turns instead of reading
     # the same "last dispatch" and waking at the same instant.
     #
-    # Keyed by the DOMAIN, not by id(slot). Downloader._slot_gc destroys any
-    # slot idle for 60s, and CPython reuses the freed address almost
-    # immediately: a direct test recycled the id 1,999 times out of 2,000. So
-    # id(slot) is neither stable for one domain nor unique across domains.
-    # A two hour run produced exactly this failure twice on panasonic.jp, both
-    # after gaps of over 120s, which is long enough for the slot to have been
-    # collected and rebuilt. The rebuilt slot started from lastseen=0 and its
-    # entry here was gone, so two requests dispatched 0.001s apart.
+    # Keyed by the domain the URL names, not by id(slot) and not by meta.
     #
-    # The domain string is stable across slot GC and unique between domains,
-    # which is exactly the identity the rate limit is defined on.
+    # Not id(slot): Downloader._slot_gc destroys any slot idle for 60s, and
+    # CPython reuses the freed address almost immediately, measured at 1,999
+    # recycles in 2,000 allocations. So id(slot) is neither stable for one
+    # domain nor unique across domains. A two hour run produced exactly that
+    # failure twice on panasonic.jp, both after quiet periods long enough for
+    # the slot to be collected and rebuilt.
+    #
+    # Not meta: a request built from another request inherits its meta, so a
+    # redirect or a meta refresh carries the source domain's key to a target
+    # on a different domain. A 10 minute run produced six violations that way,
+    # every one of them invisible here because the timer believed it was
+    # looking at the source domain's history.
+    #
+    # The domain string derived from the URL is stable across slot GC, unique
+    # between domains, and impossible to inherit. It is also exactly what
+    # ops/verify_politeness.py groups by, so the two cannot diverge.
     next_allowed: dict[str, float] = {}
 
     # Diagnostics. last_dispatch records what actually went out per slot, which
@@ -169,9 +179,13 @@ def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
 
     async def _download_with_stamp(self, slot, request):
         if min_gap > 0:
-            slot_id = request.meta.get(_dl.Downloader.DOWNLOAD_SLOT) or slot_key(
-                request.url
-            )
+            # Derived from the URL, never read from meta. meta is copied
+            # between requests by every component that builds one from
+            # another, so a target request can arrive carrying the source
+            # domain's key and be spaced against the wrong history. See
+            # crawler/downloader.py, which keys Scrapy's own slots the same
+            # way for the same reason.
+            slot_id = slot_key(request.url)
             # Claim a turn before awaiting. Without this, coroutines released
             # together all read the same previous time and wake at the same
             # instant; a measured run left two of three gaps at 0.000s.

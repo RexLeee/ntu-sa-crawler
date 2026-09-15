@@ -22,6 +22,18 @@ ROBOTSTXT_OBEY = _pol["obey_robotstxt"]
 ROBOTSTXT_PARSER = "scrapy.robotstxt.ProtegoRobotParser"
 DOWNLOAD_DELAY = _pol["download_delay"]
 CONCURRENT_REQUESTS_PER_DOMAIN = _pol["concurrent_requests_per_domain"]
+# Scrapy keys a download slot by meta['download_slot'], else by hostname.
+# Neither is the registered domain, and meta is inherited by any request built
+# from another one. This subclass derives the key from the URL instead, which
+# is the same definition ops/verify_politeness.py checks. See
+# crawler/downloader.py.
+DOWNLOADER = "crawler.downloader.DomainSlotDownloader"
+# A meta refresh builds its target with source_request.replace(), which copies
+# meta wholesale and inherits dont_filter. That gave the target the source
+# domain's timer and let it skip the dupefilter: a 10 minute run fetched
+# dozens of URLs twice. A broad crawl does not need to follow meta refresh,
+# and DOWNLOADER above would now keep it compliant either way.
+METAREFRESH_ENABLED = _crawl["follow_meta_refresh"]
 # Scrapy randomizes the delay to 0.5x-1.5x by default. At a 5s delay that
 # produces 2.5s gaps, which breaks the 0.2 qps limit. Must stay 0.
 DOWNLOAD_DELAY_JITTER = _pol["download_delay_jitter"]
@@ -115,8 +127,6 @@ RUNSTATS_INTERVAL = _crawl["runstats_interval"]
 RUNSTATS_OBJECTS_INTERVAL = _crawl["runstats_objects_interval"]
 
 DOWNLOADER_MIDDLEWARES = {
-    # Must run before robots so the robots fetch inherits the right slot.
-    "crawler.middlewares.slot.SlotKeyMiddleware": 90,
     "scrapy.downloadermiddlewares.robotstxt.RobotsTxtMiddleware": None,
     "crawler.middlewares.robots.PoliteRobotsTxtMiddleware": 100,
     # A cross-domain redirect would otherwise keep the source domain's slot

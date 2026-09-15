@@ -7,20 +7,20 @@ domain from monopolising the frontier.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections import defaultdict
 
 from scrapy import Request, Spider, signals
 from scrapy.exceptions import CloseSpider
 
-from crawler.config import PROJECT_ROOT, data_dir, load_config
+from crawler.config import PROJECT_ROOT, data_dir, load_config, state_dir
 from crawler.dispatch import DISPATCH_TIME
 from crawler.dispatch import install as install_dispatch_timer
 from crawler.extract import find_base_href, iter_hrefs
 from crawler.filters import UrlFilter
+from crawler.handoff import Handoff
 from crawler.logwriter import GzipLineWriter, now
-from crawler.slot import slot_key
+from crawler.slot import shard_of, slot_key
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,13 @@ class BroadSpider(Spider):
         # The trace records any dispatch pair that lands closer than the floor,
         # with the slot and timer state that produced it. It writes only on a
         # short gap, so it stays on for the whole run.
+        self.shard = int(shard)
+        self.shards = int(shards)
+        suffix = f"-{self.shard}" if self.shards > 1 else ""
+
         trace = None
         if self.cfg["politeness"].get("trace_short_gaps", False):
-            trace = str(data_dir() / "violation-trace.log")
+            trace = str(data_dir() / f"violation-trace{suffix}.log")
         install_dispatch_timer(self.cfg["politeness"]["required_min_gap"], trace)
         self.filter = UrlFilter(self.cfg)
 
@@ -56,8 +60,16 @@ class BroadSpider(Spider):
         self.dupe_skipped = 0
         self.discovered_raw = 0
 
-        self.shard = int(shard)
-        self.shards = int(shards)
+        # Cross-shard URLs are handed to their owner rather than dropped. A
+        # broad crawl discovers nearly every new domain through a cross-domain
+        # link, and throughput is bounded by the domains a process holds, so
+        # discarding them would leave N processes crawling little more than
+        # one. See crawler/handoff.py.
+        sharding = self.cfg["sharding"]
+        self.handoff = Handoff(self.shard, self.shards, state_dir() / "handoff")
+        self._handoff_interval = float(sharding["handoff_poll_interval"])
+        self._handoff_batch = int(sharding["handoff_batch_max"])
+        self._handoff_loop = None
 
         # -a seeds=... wins, then the production list, then the smoke list.
         seeds_path = seeds or self.cfg["seeds"]["seeds_file"]
@@ -69,7 +81,6 @@ class BroadSpider(Spider):
         self.seen_domains: set[str] = set()
 
         d = data_dir()
-        suffix = f"-{self.shard}" if self.shards > 1 else ""
         self.crawled_log = GzipLineWriter(d / f"crawled{suffix}.log.gz")
         self.discovered_log = GzipLineWriter(d / f"discovered{suffix}.log.gz")
 
@@ -98,8 +109,60 @@ class BroadSpider(Spider):
         # reading it here silently left the filter at None and disabled the
         # whole optimisation, which a run showed as dupe_skipped stuck at 0.
         crawler.signals.connect(spider._bind_dupefilter, signal=signals.spider_opened)
+        crawler.signals.connect(spider._start_handoff, signal=signals.spider_opened)
+        crawler.signals.connect(spider._stop_handoff, signal=signals.spider_closed)
         crawler.signals.connect(spider._record_stats, signal=signals.spider_closed)
         return spider
+
+    def _start_handoff(self, spider) -> None:
+        """Begin draining the inbox other shards write to.
+
+        A timer rather than a generator because the URLs arrive continuously
+        for the whole run, while Spider.start() is consumed once. The engine
+        also stops pulling from start() under backpressure, which would stall
+        handoff delivery exactly when the other shards are busiest.
+        """
+        if self.shards <= 1:
+            return
+        from scrapy.utils.asyncio import create_looping_call
+
+        self._handoff_loop = create_looping_call(self._drain_handoff)
+        self._handoff_loop.start(self._handoff_interval, now=False)
+
+    def _stop_handoff(self, spider, reason) -> None:
+        if self._handoff_loop is not None and getattr(
+            self._handoff_loop, "running", False
+        ):
+            self._handoff_loop.stop()
+        self.handoff.close()
+
+    def _drain_handoff(self) -> None:
+        """Inject URLs other shards handed us.
+
+        Batched because this runs on the reactor thread: an unbounded inbox
+        would block every download for as long as it took to admit.
+
+        engine.crawl goes through the scheduler, so the frontier cap and the
+        dupefilter apply exactly as they do to a link found locally. These
+        URLs are deliberately not counted into discovered_raw: the shard that
+        found them already did, and counting again would inflate the Tier 1
+        metric by the number of times a URL crosses a process boundary.
+        """
+        try:
+            urls = self.handoff.poll(self._handoff_batch)
+        except Exception as exc:  # a broken inbox must not stop the crawl
+            logger.warning("handoff poll failed: %s", exc)
+            return
+
+        for url in urls:
+            key = slot_key(url)
+            if self.crawled_per_domain.get(key, 0) >= self.max_crawled_per_domain:
+                continue
+            if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
+                continue
+            request = self._admit(url, key)
+            if request is not None:
+                self.crawler.engine.crawl(request)
 
     def _bind_dupefilter(self, spider) -> None:
         self.dupefilter = getattr(self.crawler, "bloom_dupefilter", None)
@@ -116,6 +179,8 @@ class BroadSpider(Spider):
         stats.set_value("discovered/unique", self.discovered_log.count)
         stats.set_value("dupefilter/skipped_before_request", self.dupe_skipped)
         stats.set_value("domains/seen", len(self.seen_domains))
+        stats.set_value("handoff/sent", self.handoff.sent)
+        stats.set_value("handoff/received", self.handoff.received)
 
     def _release_queued(self, key: str) -> None:
         remaining = self.queued_per_domain.get(key, 0) - 1
@@ -146,7 +211,9 @@ class BroadSpider(Spider):
             if not url or url.startswith("#"):
                 continue
             key = slot_key(url)
-            if self.shards > 1 and self._shard_of(key) != self.shard:
+            # Not handed over. Every process reads the same seed file, so the
+            # owner finds its own seeds without being told.
+            if self.shards > 1 and shard_of(key, self.shards) != self.shard:
                 continue
             self.seen_domains.add(key)
             count += 1
@@ -159,11 +226,14 @@ class BroadSpider(Spider):
         self.crawled_log.close()
         self.discovered_log.close()
         logger.info(
-            "closed(%s): crawled=%d discovered=%d domains=%d",
+            "closed(%s): crawled=%d discovered=%d domains=%d handoff_sent=%d "
+            "handoff_received=%d",
             reason,
             self.crawled_log.count,
             self.discovered_log.count,
             len(self.seen_domains),
+            self.handoff.sent,
+            self.handoff.received,
         )
 
     # --- parsing ------------------------------------------------------------
@@ -212,7 +282,7 @@ class BroadSpider(Spider):
         return out
 
     def _maybe_follow(self, url: str, response):
-        """Decide whether to fetch a discovered URL, cheapest test first.
+        """Decide what to do with a URL found on a page.
 
         Order matters and is deliberate:
 
@@ -223,11 +293,17 @@ class BroadSpider(Spider):
         The filter has to come last because it is the only step with a side
         effect. A URL rejected by a limit stays unseen and can be rediscovered
         once that domain drains; a URL added to the filter never comes back.
+
+        Sharding sits before the filter for the same reason. A URL another
+        shard owns must not be recorded here, or this process would suppress
+        it while never fetching it.
         """
         key = slot_key(url)
 
         # Every URL that survives filtering counts as discovered, even when we
-        # choose not to fetch it. The metric is discovery, not fetching.
+        # choose not to fetch it, and even when it belongs to another shard.
+        # The metric is discovery, not fetching, and each URL reaches this
+        # line in exactly one process.
         self.discovered_raw += 1
 
         # .get() rather than [key]: defaultdict.__getitem__ inserts, so
@@ -237,9 +313,23 @@ class BroadSpider(Spider):
             return
         if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
             return
-        if self.shards > 1 and self._shard_of(key) != self.shard:
-            return  # another worker owns this domain
 
+        if self.shards > 1:
+            owner = shard_of(key, self.shards)
+            if owner != self.shard:
+                self.handoff.send(url, owner)
+                return
+
+        request = self._admit(url, key)
+        if request is not None:
+            yield request
+
+    def _admit(self, url: str, key: str) -> Request | None:
+        """Turn a URL this shard owns into a Request, or refuse it.
+
+        Shared by page links and by URLs handed over from another shard, so
+        both face the same duplicate filter and the same logging.
+        """
         # Test the filter here rather than let the scheduler do it. Three
         # quarters of yielded requests are duplicates, and reaching the
         # scheduler means each one was allocated, passed through the spider
@@ -248,7 +338,7 @@ class BroadSpider(Spider):
         if self.dupefilter is not None:
             if self.dupefilter.url_seen(url):
                 self.dupe_skipped += 1
-                return
+                return None
             # Already recorded above, so the scheduler must not test again.
             dont_filter = True
         else:
@@ -271,22 +361,4 @@ class BroadSpider(Spider):
             # CappedScheduler lets this past a full frontier. See its
             # enqueue_request: domain count is what bounds throughput.
             meta["new_domain"] = True
-        yield Request(url, callback=self.parse, meta=meta, dont_filter=dont_filter)
-
-    def _shard_of(self, key: str) -> int:
-        """Assign a domain to a worker. Stable across processes, unlike hash().
-
-        Hashes the whole key rather than its first 8 bytes. Domains share
-        prefixes heavily, so truncating skews the split. Measured over 5,994
-        real domains, max/min load per shard:
-
-            shards   first 8 bytes   md5
-                 4          1.263x   1.062x
-                 6          1.171x   1.099x
-                 8          2.012x   1.124x
-
-        At 8 workers, the value this project would use, one process would
-        otherwise carry twice the load of another while cores sit idle.
-        """
-        digest = hashlib.md5(key.encode("utf-8"), usedforsecurity=False).digest()
-        return int.from_bytes(digest[:8], "big") % self.shards
+        return Request(url, callback=self.parse, meta=meta, dont_filter=dont_filter)

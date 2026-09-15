@@ -6,6 +6,10 @@
 # This samples resources on a fixed interval so the growth curve can be
 # plotted, not just its endpoint.
 #
+# Starts sharding.shards processes, each owning a disjoint set of domains.
+# Every per-domain rate limit is therefore enforced inside one process and
+# needs no coordination between them. See crawler/handoff.py.
+#
 # Usage: ops/run_hour.sh [duration_seconds] [seeds_file]
 set -euo pipefail
 
@@ -30,21 +34,28 @@ export MALLOC_MMAP_THRESHOLD_=131072
 DURATION="${1:-3600}"
 SEEDS="${2:-seeds/seeds_1000.txt}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-30}"
+# Single source of truth is config.toml, so the workers and the verifier can
+# never disagree about how many shards exist.
+SHARDS="${SHARDS:-$(grep -E '^shards[[:space:]]*=' config.toml | head -1 | tr -dc '0-9')}"
+SHARDS="${SHARDS:-1}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 RUNDIR="data/run-${STAMP}"
 mkdir -p "$RUNDIR"
 
 # Start clean so the metrics describe this run alone.
-rm -f data/crawled.log.gz data/discovered.log.gz data/runstats.tsv data/objects.log
+rm -f data/crawled*.log.gz data/discovered*.log.gz data/runstats*.tsv data/objects*.log
 # The trace is opened in append mode, so a previous run's contents would be
 # read as this one's. It is now a pass/fail signal rather than a diagnostic:
 # the timer and ops/verify_politeness.py group by the same key, so anything
 # written here is a real short gap.
-rm -f data/violation-trace.log
-rm -rf state/job
+rm -f data/violation-trace*.log
+# The handoff inboxes are offsets into append-only files. A stale one would
+# make a worker skip past URLs it never saw, or replay ones it already did.
+rm -rf state/job state/job-* state/handoff
 
 echo "run dir      : $RUNDIR"
 echo "duration     : ${DURATION}s"
+echo "shards       : $SHARDS"
 echo "seeds        : $SEEDS ($(grep -c '^https' "$SEEDS" 2>/dev/null || echo 0) urls)"
 echo "fd limit     : $(ulimit -n)"
 echo "started      : $(date -Iseconds)"
@@ -54,26 +65,31 @@ echo "started      : $(date -Iseconds)"
 # minutes in testing and had to be killed anyway. The logs are flushed as the
 # crawl runs, so stopping the process directly loses nothing but the final
 # gzip end-of-stream marker, which the analysis tools already tolerate.
-uv run scrapy crawl broad -a "seeds=${SEEDS}" --logfile "$RUNDIR/scrapy.log" &
-CRAWL_PID=$!
-echo "pid          : $CRAWL_PID"
+PIDS=()
+for i in $(seq 0 $((SHARDS - 1))); do
+    uv run scrapy crawl broad \
+        -a "seeds=${SEEDS}" -a "shard=${i}" -a "shards=${SHARDS}" \
+        -s "JOBDIR=state/job-${i}" \
+        --logfile "$RUNDIR/scrapy-${i}.log" &
+    PIDS+=($!)
+    echo "shard $i pid : ${PIDS[-1]}"
+done
 
 # Copy the logs into the run directory whatever happens, including Ctrl-C or
 # the machine being shut down. A previous run lost its final statistics
 # because this only ran on the clean-exit path.
 collect() {
-    cp data/crawled.log.gz data/discovered.log.gz "$RUNDIR/" 2>/dev/null || true
-    cp data/runstats.tsv data/objects.log "$RUNDIR/" 2>/dev/null || true
-    cp data/violation-trace.log "$RUNDIR/" 2>/dev/null || true
+    cp data/crawled*.log.gz data/discovered*.log.gz "$RUNDIR/" 2>/dev/null || true
+    cp data/runstats*.tsv data/objects*.log "$RUNDIR/" 2>/dev/null || true
+    cp data/violation-trace*.log "$RUNDIR/" 2>/dev/null || true
 }
 trap collect EXIT INT TERM
 
-# The crawl runs under `uv run`, so the python process is a child of the
+# Each crawl runs under `uv run`, so the python process is a child of the
 # recorded pid. Sample the whole tree rather than the launcher.
-sample_tree_rss() {
-    local total=0 pid
-    for pid in $(pgrep -P "$CRAWL_PID" 2>/dev/null) "$CRAWL_PID"; do
-        local rss
+tree_rss() {
+    local root="$1" total=0 pid rss
+    for pid in $(pgrep -P "$root" 2>/dev/null) "$root"; do
         rss=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
         total=$((total + ${rss:-0}))
     done
@@ -82,27 +98,46 @@ sample_tree_rss() {
 
 leaf_pid() {
     local child
-    child=$(pgrep -P "$CRAWL_PID" 2>/dev/null | head -1)
-    echo "${child:-$CRAWL_PID}"
+    child=$(pgrep -P "$1" 2>/dev/null | head -1)
+    echo "${child:-$1}"
+}
+
+any_alive() {
+    local pid
+    for pid in "${PIDS[@]}"; do
+        kill -0 "$pid" 2>/dev/null && return 0
+    done
+    return 1
 }
 
 {
-    printf 'ts\telapsed\trss_kb\tthreads\tfds\ttcp_est\tcrawled_bytes\tdiscovered_bytes\n'
+    # One rss column per shard, so a shard that grows faster than the others
+    # is visible rather than hidden in the total. That is what decides how
+    # many shards this machine can hold.
+    header='ts\telapsed\trss_kb\tthreads\tfds\ttcp_est\tcrawled_bytes\tdiscovered_bytes'
+    for i in $(seq 0 $((SHARDS - 1))); do header="${header}\trss_kb_${i}"; done
+    printf "${header}\n"
     START=$(date +%s)
-    while kill -0 "$CRAWL_PID" 2>/dev/null; do
+    while any_alive; do
         NOW=$(date +%s)
         if [ $((NOW - START)) -ge "$DURATION" ]; then
             break
         fi
-        LEAF=$(leaf_pid)
-        RSS=$(sample_tree_rss)
+        TOTAL=0
+        PER_SHARD=""
+        for pid in "${PIDS[@]}"; do
+            RSS=$(tree_rss "$pid")
+            TOTAL=$((TOTAL + RSS))
+            PER_SHARD="${PER_SHARD}\t${RSS}"
+        done
+        LEAF=$(leaf_pid "${PIDS[0]}")
         THR=$(awk '/^Threads:/{print $2}' "/proc/$LEAF/status" 2>/dev/null || echo 0)
         FDS=$(ls "/proc/$LEAF/fd" 2>/dev/null | wc -l)
         TCP=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
-        CB=$(stat -c %s data/crawled.log.gz 2>/dev/null || echo 0)
-        DB=$(stat -c %s data/discovered.log.gz 2>/dev/null || echo 0)
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$NOW" "$((NOW - START))" "$RSS" "$THR" "$FDS" "$TCP" "$CB" "$DB"
+        CB=$(stat -c %s data/crawled*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        DB=$(stat -c %s data/discovered*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s${PER_SHARD}\n" \
+            "$NOW" "$((NOW - START))" "$TOTAL" "$THR" "$FDS" "$TCP" "$CB" "$DB"
         sleep "$SAMPLE_INTERVAL"
     done
 } > "$RUNDIR/resources.tsv"
@@ -111,21 +146,25 @@ leaf_pid() {
 # captures the run even if everything below goes wrong.
 collect
 
-# SIGTERM first so the dupefilter gets its chance to persist, then SIGKILL,
+# SIGTERM first so each dupefilter gets its chance to persist, then SIGKILL,
 # because graceful shutdown does not finish at this concurrency: it waits for
 # every parked request to time out, which took over five minutes in testing.
 echo "stopping     : $(date -Iseconds)"
-kill -TERM "$CRAWL_PID" 2>/dev/null || true
+for pid in "${PIDS[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+done
 for _ in $(seq 1 20); do
-    kill -0 "$CRAWL_PID" 2>/dev/null || break
+    any_alive || break
     sleep 1
 done
-# `uv run` is the parent; killing it alone leaves the python child running.
-pkill -9 -P "$CRAWL_PID" 2>/dev/null || true
-kill -9 "$CRAWL_PID" 2>/dev/null || true
-wait "$CRAWL_PID" 2>/dev/null || true
+for pid in "${PIDS[@]}"; do
+    # `uv run` is the parent; killing it alone leaves the python child running.
+    pkill -9 -P "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+done
 
-# Again, to pick up whatever the crawl flushed during shutdown.
+# Again, to pick up whatever the crawls flushed during shutdown.
 collect
 echo "finished     : $(date -Iseconds)"
 echo "run dir      : $RUNDIR"

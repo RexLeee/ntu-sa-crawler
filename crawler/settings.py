@@ -46,7 +46,7 @@ DOWNLOAD_MAXSIZE = _crawl["download_maxsize"]
 DOWNLOAD_WARNSIZE = 0
 REACTOR_THREADPOOL_MAXSIZE = _crawl["reactor_threadpool_maxsize"]
 DNSCACHE_ENABLED = True
-DNSCACHE_SIZE = 200_000
+DNSCACHE_SIZE = _crawl["dns_cache_size"]
 # CachingThreadedResolver runs lookups in the reactor thread pool and has no
 # negative cache, so at the 60s default one dead domain holds a thread for a
 # minute. A measured run lost 48% of the pool to 2,118 DNS failures.

@@ -121,13 +121,13 @@ class RunStats:
         self._lag_expected = time.monotonic() + self._lag_interval
         self._lags: list[float] = []
 
-        d = data_dir()
-        self._path = d / "runstats.tsv"
-        self._objects_path = d / "objects.log"
-        self._fh = self._path.open("a", encoding="utf-8")
-        if self._path.stat().st_size == 0:
-            self._fh.write("\t".join(COLUMNS) + "\n")
-            self._fh.flush()
+        # Opened in spider_opened, not here. The shard number lives on the
+        # spider, and Crawler.crawl builds extensions before it builds the
+        # spider, so the filename cannot be known yet. Sharing one file
+        # between N processes would interleave their rows.
+        self._path = None
+        self._objects_path = None
+        self._fh = None
 
         self._stats_loop = None
         self._lag_loop = None
@@ -148,6 +148,15 @@ class RunStats:
         # the same way scrapy.core.downloader imports it.
         from scrapy.utils.asyncio import create_looping_call
 
+        d = data_dir()
+        suffix = f"-{spider.shard}" if getattr(spider, "shards", 1) > 1 else ""
+        self._path = d / f"runstats{suffix}.tsv"
+        self._objects_path = d / f"objects{suffix}.log"
+        self._fh = self._path.open("a", encoding="utf-8")
+        if self._path.stat().st_size == 0:
+            self._fh.write("\t".join(COLUMNS) + "\n")
+            self._fh.flush()
+
         self._lag_loop = create_looping_call(self._tick_lag)
         self._lag_loop.start(self._lag_interval, now=False)
         self._stats_loop = create_looping_call(self._sample)
@@ -158,8 +167,10 @@ class RunStats:
         for loop in (self._stats_loop, self._lag_loop):
             if loop is not None and getattr(loop, "running", False):
                 loop.stop()
-        self._sample()
-        self._fh.close()
+        if self._fh is not None:
+            self._sample()
+            self._fh.close()
+            self._fh = None
 
     # --- measurement --------------------------------------------------------
 
@@ -222,6 +233,8 @@ class RunStats:
         return len(mw._parsers), len(mw._inflight)
 
     def _sample(self) -> None:
+        if self._fh is None:
+            return
         now = time.monotonic()
         proc_pct, main_pct = self._cpu_percentages(now)
 

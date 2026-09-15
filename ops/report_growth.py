@@ -106,9 +106,24 @@ def _describe(name: str, ts: list[float], vs: list[float], unit: str) -> None:
         print(f"  deceleration    : {late_rate / early_rate:.2f}x")
 
 
-def _domain_curve(crawled: Path, buckets: int = 40) -> tuple[list[float], list[float]]:
-    """Cumulative distinct registered domains over time, from the crawl log."""
+def _domain_curve(
+    crawled: list[Path], buckets: int = 40
+) -> tuple[list[float], list[float]]:
+    """Cumulative distinct registered domains over time, from the crawl logs.
+
+    Takes every shard's log. Each domain belongs to exactly one shard, so the
+    union is the crawl's real domain count and no deduplication across files
+    is needed beyond the set already used here.
+    """
     stamps: list[tuple[float, str]] = []
+    for path in crawled:
+        _read_stamps(path, stamps)
+
+    stamps.sort()
+    return _bucket(stamps, buckets)
+
+
+def _read_stamps(crawled: Path, stamps: list[tuple[float, str]]) -> None:
     try:
         with gzip.open(crawled, "rt", encoding="utf-8") as fh:
             for line in fh:
@@ -124,10 +139,14 @@ def _domain_curve(crawled: Path, buckets: int = 40) -> tuple[list[float], list[f
         # end-of-stream marker yet. Everything already decoded is still
         # valid, which is what matters for inspecting a run in progress.
         pass
+
+
+def _bucket(
+    stamps: list[tuple[float, str]], buckets: int
+) -> tuple[list[float], list[float]]:
     if not stamps:
         return [], []
 
-    stamps.sort(key=lambda s: s[0])
     t0 = stamps[0][0]
     span = stamps[-1][0] - t0
     if span <= 0:
@@ -177,10 +196,11 @@ def main() -> int:
 
     _describe("memory (RSS MB)", ts, [r["rss_kb"] / 1024 for r in rows], "MB")
 
-    crawled = rundir / "crawled.log.gz"
-    if not crawled.exists():
-        crawled = Path("data/crawled.log.gz")
-    if crawled.exists():
+    # Every shard writes its own log, and each domain belongs to one shard.
+    crawled = sorted(rundir.glob("crawled*.log.gz"))
+    if not crawled:
+        crawled = sorted(Path("data").glob("crawled*.log.gz"))
+    if crawled:
         dts, dvs = _domain_curve(crawled)
         if dts:
             _describe("distinct domains", dts, dvs, "domains")

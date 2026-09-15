@@ -221,6 +221,47 @@ def test_resume_from_startprios() -> bool:
     return True
 
 
+def test_scan_limit_does_not_starve() -> bool:
+    """A domain beyond the scan limit must still get served.
+
+    pop() only looks at the first PQUEUE_SCAN_LIMIT ring entries. If the ring
+    did not rotate what it skips to the back, every domain past that window
+    would be invisible forever, and the crawl would circle a handful of
+    domains while the frontier grew.
+
+    Run with every domain busy so the cap is reached on every single pop,
+    which is the worst case for this property.
+    """
+    domains = 50
+    queue, crawler = _queue(scan_limit=3)
+    for i in range(domains):
+        for n in range(4):
+            queue.push(_request(f"d{i}.example", n))
+        _mark_active(crawler, f"d{i}.example")
+
+    served: dict[str, int] = {}
+    for _ in range(domains * 4):
+        request = queue.pop()
+        if request is None:
+            break
+        slot = _slot_of(request)
+        served[slot] = served.get(slot, 0) + 1
+
+    if len(served) != domains:
+        missing = domains - len(served)
+        print(f"FAIL: {missing} of {domains} domains never served past a scan limit of 3")
+        return False
+    spread = max(served.values()) - min(served.values())
+    if spread > 1:
+        print(f"FAIL: uneven service, {min(served.values())} to {max(served.values())}")
+        return False
+    print(
+        f"PASS: all {domains} domains served evenly with a scan limit of 3 "
+        f"({min(served.values())} each)"
+    )
+    return True
+
+
 def _time_pop(cls, domains: int, pops: int = 2_000) -> float:
     """Microseconds per pop() at a given domain count."""
     global QUEUE_CLS
@@ -296,6 +337,7 @@ def main() -> int:
         test_returns_none_only_when_empty(),
         test_stale_entry_and_repush(),
         test_resume_from_startprios(),
+        test_scan_limit_does_not_starve(),
         test_pop_cost_beats_the_parent(),
     ]
     return 0 if all(results) else 1

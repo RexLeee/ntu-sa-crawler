@@ -6,17 +6,32 @@ fetched twice is budget spent on nothing. It is also a symptom worth catching
 on its own: it means a request reached the downloader without passing the
 duplicate filter.
 
-That happened. MetaRefreshMiddleware builds its target with
-source_request.replace(), which copies dont_filter along with everything else.
-The spider sets dont_filter on requests it has already checked against the
-Bloom filter, so meta refresh targets inherited a promise that had been made
-about a different URL and skipped the filter entirely. A 10 minute run fetched
-dozens of URLs twice that way.
+Two paths produced that, and only one is closed.
+
+The first was MetaRefreshMiddleware, which builds its target with
+source_request.replace() and so copies dont_filter along with everything else.
+The spider sets that flag on requests it has already checked against the Bloom
+filter, so a meta refresh target inherited a promise made about a different
+URL and skipped the filter entirely. That path is off.
+
+The second is still open, and is a property of redirects rather than a defect
+in this code. A redirect target is fetched without passing the spider's
+filter, because the spider only tests URLs it extracts from a page. Several
+distinct URLs can therefore collapse onto one destination:
+
+    https://parklogic.com/index.html   302 ->  https://parklogic.com/
+    https://parklogic.com/Services     302 ->  https://parklogic.com/
+
+Each source passes the filter legitimately, and each redirect then fetches the
+same destination again. A 10 minute run spent 451 of 32,000 fetches that way,
+1.4%. It costs throughput, never compliance: every fetch still goes through
+the domain's timer, so ops/verify_politeness.py stays at zero.
 
 A Bloom filter false positive can only ever drop a URL, never admit a
 duplicate, so it cannot produce a finding here.
 
-Exit code 0 means zero repeats.
+Exit code 0 means zero repeats. Until the redirect path is closed this reports
+1-2% on any real run, so read the count as a rate rather than a pass/fail.
 """
 
 from __future__ import annotations

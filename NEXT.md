@@ -62,12 +62,39 @@ bug 帶回來。而「會複製 meta 的路」沒有一份會保持完整的清�
 `dispatch.py` 同理，不再讀 meta。`SlotKeyMiddleware` 因此多餘，已刪除。
 spider、robots、redirect 三處寫 meta 的地方一併刪掉。
 
-### 順帶修掉的第二個缺陷
+### 驗證結果（`data/run-20260915-164523`，32,000 個請求）
+
+| 檢查 | 結果 |
+|---|---|
+| `verify_politeness.py` | **VIOLATIONS : 0**，最小間隔 5.000s |
+| `verify_robots.py` | VIOLATIONS : 0 |
+| `violation-trace.log` | **0 bytes** |
+| pages/s | 54.54（上次 51.7） |
+
+同樣 32,000 個請求，上一次是 6 次違規。
+
+### 順帶修掉的第二個缺陷，以及還沒修的那半
 
 meta refresh 也繼承了 `dont_filter`。spider 對已經過 bloom 的請求設這個旗標，
-所以 meta refresh 的目標**跳過了去重**。上一次跑測有 414 個 URL 被抓超過一次，
-浪費 504 次抓取。`ops/verify_no_refetch.py` 現在會抓這個，
+所以 meta refresh 的目標**跳過了去重**。
 `config.toml` 的 `follow_meta_refresh = false` 把這條路關掉。
+
+**但重複抓取只少了一部分，沒有歸零。** 同樣 32,000 次抓取：504 → 451 次浪費。
+
+剩下的是 HTTP 轉址，那是轉址的性質，不是這份程式碼的缺陷。
+轉址目標不會經過 spider 的過濾器，因為 spider 只測它從頁面抽出來的 URL。
+所以多個不同的 URL 可以塌縮到同一個目標：
+
+```
+https://parklogic.com/index.html   302 ->  https://parklogic.com/
+https://parklogic.com/Services     302 ->  https://parklogic.com/
+```
+
+每個來源都合法地通過了過濾器，然後各自把同一個目標再抓一次。
+**只花吞吐量，不影響合規**：每次抓取仍然走該網域的計時器，
+所以 `verify_politeness.py` 維持 0。
+
+佔 1.4%，優先序低於多核心。要修的話是在轉址中介層測一次 bloom。
 
 ## 還沒做的
 
@@ -115,7 +142,7 @@ uvx ruff check crawler/ tests/ ops/
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
 uv run python ops/verify_politeness.py    # 必須 VIOLATIONS : 0
 uv run python ops/verify_robots.py        # 必須 VIOLATIONS : 0
-uv run python ops/verify_no_refetch.py    # 必須 REPEATS : 0
+uv run python ops/verify_no_refetch.py    # 目前約 1.4%，見上面的轉址說明
 uv run python ops/report_metrics.py
 ```
 

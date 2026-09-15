@@ -132,10 +132,16 @@ any_alive() {
         done
         LEAF=$(leaf_pid "${PIDS[0]}")
         THR=$(awk '/^Threads:/{print $2}' "/proc/$LEAF/status" 2>/dev/null || echo 0)
-        FDS=$(ls "/proc/$LEAF/fd" 2>/dev/null | wc -l)
-        TCP=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
-        CB=$(stat -c %s data/crawled*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}')
-        DB=$(stat -c %s data/discovered*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        # Same pipefail hazard as the stat calls below: ls fails once the
+        # process exits, and ss fails if the tool is briefly unavailable.
+        FDS=$(ls "/proc/$LEAF/fd" 2>/dev/null | wc -l || true)
+        TCP=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l || true)
+        # `|| true` is load-bearing. stat exits non-zero while the glob still
+        # matches nothing, which it does for the first seconds of every run,
+        # and `set -o pipefail` would then take the whole script down before
+        # the first sample was ever written.
+        CB=$(stat -c %s data/crawled*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)
+        DB=$(stat -c %s data/discovered*.log.gz 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s${PER_SHARD}\n" \
             "$NOW" "$((NOW - START))" "$TOTAL" "$THR" "$FDS" "$TCP" "$CB" "$DB"
         sleep "$SAMPLE_INTERVAL"

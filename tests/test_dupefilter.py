@@ -133,6 +133,49 @@ def main() -> int:
 
         del df
 
+    # 6. The spider must actually hold the filter. Crawler.crawl builds the
+    # spider before the engine, and the engine is what builds the scheduler
+    # and its dupefilter, so reading crawler.bloom_dupefilter in the spider's
+    # from_crawler yields None. That failed silently: the crawl ran correctly
+    # but did all the work the filter was meant to avoid. A run showed it only
+    # as dupe_skipped stuck at 0 against 768,922 discovered URLs.
+    check("spider binds the dupefilter at spider_opened", _spider_binds_filter())
+
+
+def _spider_binds_filter() -> bool:
+    from scrapy.utils.misc import build_from_crawler
+    from scrapy.utils.test import get_crawler
+
+    from crawler.spiders.broad import BroadSpider
+
+    with tempfile.TemporaryDirectory() as tmp:
+        crawler = get_crawler(
+            BroadSpider,
+            {
+                "JOBDIR": tmp,
+                "DUPEFILTER_CLASS": "crawler.dupefilter.BloomDupeFilter",
+                "BLOOM_DUPEFILTER_CAPACITY": 10_000,
+                "SCHEDULER_PRIORITY_QUEUE": "scrapy.pqueues.DownloaderAwarePriorityQueue",
+                "CONCURRENT_REQUESTS_PER_IP": 0,
+            },
+        )
+        crawler._apply_settings()
+        # This order is the point of the test: Crawler.crawl creates the
+        # spider first, and only then the engine, which builds the scheduler
+        # and with it the dupefilter.
+        spider = crawler._create_spider()
+        crawler.engine = crawler._create_engine()
+        scheduler = build_from_crawler(crawler.engine.scheduler_cls, crawler)
+        scheduler.open(spider)
+
+        spider._bind_dupefilter(spider)
+        bound = spider.dupefilter is not None
+        if bound:
+            # It must be the live instance, not a second filter of its own.
+            bound = spider.dupefilter is crawler.bloom_dupefilter
+        scheduler.close("test")
+        return bound
+
     print()
     if failures:
         print(f"{failures} check(s) failed")

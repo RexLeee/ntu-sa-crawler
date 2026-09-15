@@ -85,10 +85,23 @@ class BroadSpider(Spider):
             spider._on_request_settled, signal=signals.request_left_downloader
         )
         crawler.signals.connect(spider._on_request_settled, signal=signals.request_dropped)
-        # BloomDupeFilter publishes itself here in its own from_crawler.
-        spider.dupefilter = getattr(crawler, "bloom_dupefilter", None)
-        spider.crawler.signals.connect(spider._record_stats, signal=signals.spider_closed)
+        # The dupefilter cannot be read here. Crawler.crawl builds the spider
+        # before it builds the engine, and the engine is what constructs the
+        # scheduler and its dupefilter, so crawler.bloom_dupefilter does not
+        # exist yet. Binding it at spider_opened is the earliest safe point;
+        # reading it here silently left the filter at None and disabled the
+        # whole optimisation, which a run showed as dupe_skipped stuck at 0.
+        crawler.signals.connect(spider._bind_dupefilter, signal=signals.spider_opened)
+        crawler.signals.connect(spider._record_stats, signal=signals.spider_closed)
         return spider
+
+    def _bind_dupefilter(self, spider) -> None:
+        self.dupefilter = getattr(self.crawler, "bloom_dupefilter", None)
+        if self.dupefilter is None:
+            logger.warning(
+                "no bloom dupefilter on the crawler; every discovered URL will "
+                "be built into a Request and filtered by the scheduler instead"
+            )
 
     def _record_stats(self, spider, reason) -> None:
         """Put the spider-side counters where the stats dump can see them."""

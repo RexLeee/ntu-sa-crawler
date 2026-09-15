@@ -37,9 +37,16 @@ TOLERANCE = 0.05
 # only come from DOWNLOAD_DELAY.
 # Scenario 2 proves the floor stands on its own: DOWNLOAD_DELAY is set below
 # it, so any gap at or above the floor must come from dispatch.py.
+# Scenario 3 reproduces a real violation from a two hour run. Scrapy's
+# Downloader._slot_gc destroys any slot idle for 60s. The floor used to be
+# keyed by id(slot), and CPython reuses a freed object's address immediately
+# (measured: 1,999 reuses in 2,000 allocations), so a domain that went quiet
+# and came back lost its gap entirely: two requests to panasonic.jp dispatched
+# 0.001s apart. Here the slot is collected between every request.
 SCENARIOS = {
     "measure": {"delay": 2.0, "floor": 0.0, "expect": 2.0},
     "enforce": {"delay": 0.5, "floor": 2.0, "expect": 2.0},
+    "slot_gc": {"delay": 0.0, "floor": 2.0, "expect": 2.0, "gc_slots": True},
 }
 
 observed: list[float] = []
@@ -72,17 +79,68 @@ class _Spider(Spider):
         super().__init__(**kw)
         self.port = int(port)
 
+    # Chained: each response yields the next request. The slot_gc scenario
+    # needs the slot to be empty between requests, which cannot happen while
+    # three siblings sit queued on it. This mirrors the production case, a
+    # domain whose next URL is discovered only after the previous page parses.
+    chained = False
+
+    def _probe(self, i: int) -> Request:
+        return Request(
+            f"http://127.0.0.1:{self.port}/?i={i}",
+            meta={"download_slot": "probe", "i": i},
+            dont_filter=True,
+            callback=self.parse,
+        )
+
     async def start(self):
-        for i in range(REQUESTS):
-            yield Request(
-                f"http://127.0.0.1:{self.port}/?i={i}",
-                meta={"download_slot": "probe"},
-                dont_filter=True,
-                callback=self.parse,
-            )
+        if self.chained:
+            yield self._probe(0)
+        else:
+            for i in range(REQUESTS):
+                yield self._probe(i)
 
     def parse(self, response):
         observed.append(float(response.meta[DISPATCH_TIME]))
+        if self.chained:
+            nxt = response.meta["i"] + 1
+            if nxt < REQUESTS:
+                yield self._probe(nxt)
+
+
+def _force_slot_gc_between_requests() -> None:
+    """Drop every idle download slot after each dispatch.
+
+    This is what Downloader._slot_gc does on its own 60s timer for any slot
+    idle that long. A 2 hour run is full of domains that go quiet and come
+    back, so the real crawl hits this constantly; a short test never would.
+    Forcing it turns a rare production race into a deterministic check.
+    """
+    import scrapy.core.downloader as dl
+
+    patched = dl.Downloader._enqueue_request
+
+    async def _enqueue_then_gc(self, request):
+        try:
+            return await patched(self, request)
+        finally:
+            # Collect here, not inside _download. _enqueue_request holds the
+            # request in slot.active for the whole download, and _slot_gc
+            # skips any slot with active requests, so a collection attempted
+            # from inside _download is silently a no-op. This finally block
+            # runs after slot.active.remove.
+            #
+            # Drop the slot outright rather than calling _slot_gc, which also
+            # refuses while any sibling request is queued on the same slot.
+            # The production case is a domain whose last request finished and
+            # whose next one arrives minutes later, so the slot is genuinely
+            # gone; forcing that here is the point of the scenario.
+            key = request.meta.get(self.DOWNLOAD_SLOT)
+            slot = self.slots.get(key) if key else None
+            if slot is not None and not slot.active:
+                self.slots.pop(key).close()
+
+    dl.Downloader._enqueue_request = _enqueue_then_gc
 
 
 def run_scenario(name: str) -> int:
@@ -95,11 +153,15 @@ def run_scenario(name: str) -> int:
     cfg = SCENARIOS[name]
     install(cfg["floor"])
 
+    if cfg.get("gc_slots"):
+        _force_slot_gc_between_requests()
+
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     process = CrawlerProcess(settings={"LOG_LEVEL": "ERROR", "DOWNLOAD_DELAY": cfg["delay"]})
+    _Spider.chained = bool(cfg.get("gc_slots"))
     process.crawl(_Spider, port=port)
     process.start()
     server.shutdown()

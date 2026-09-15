@@ -47,6 +47,8 @@ import time
 
 import scrapy.core.downloader as _dl
 
+from crawler.slot import slot_key
+
 DISPATCH_TIME = "dispatch_time"
 
 _installed = False
@@ -70,14 +72,24 @@ def install(min_gap: float = 0.0) -> None:
     # coroutines entering together get consecutive turns instead of reading
     # the same "last dispatch" and waking at the same instant.
     #
-    # Keyed by slot object rather than by name: slots are garbage collected
-    # every 60s, and a stale name would hold a gap against a slot that no
-    # longer exists.
-    next_allowed: dict[int, float] = {}
+    # Keyed by the DOMAIN, not by id(slot). Downloader._slot_gc destroys any
+    # slot idle for 60s, and CPython reuses the freed address almost
+    # immediately: a direct test recycled the id 1,999 times out of 2,000. So
+    # id(slot) is neither stable for one domain nor unique across domains.
+    # A two hour run produced exactly this failure twice on panasonic.jp, both
+    # after gaps of over 120s, which is long enough for the slot to have been
+    # collected and rebuilt. The rebuilt slot started from lastseen=0 and its
+    # entry here was gone, so two requests dispatched 0.001s apart.
+    #
+    # The domain string is stable across slot GC and unique between domains,
+    # which is exactly the identity the rate limit is defined on.
+    next_allowed: dict[str, float] = {}
 
     async def _download_with_stamp(self, slot, request):
         if min_gap > 0:
-            slot_id = id(slot)
+            slot_id = request.meta.get(_dl.Downloader.DOWNLOAD_SLOT) or slot_key(
+                request.url
+            )
             # Claim a turn before awaiting. Without this, coroutines released
             # together all read the same previous time and wake at the same
             # instant; a measured run left two of three gaps at 0.000s.
@@ -102,10 +114,17 @@ def install(min_gap: float = 0.0) -> None:
             dispatched = time.time()
             next_allowed[slot_id] = dispatched + min_gap
 
-            # Slots die; without this the dict grows for the whole run.
+            # Bound the dict. Entries whose gap has already elapsed can never
+            # constrain a future request, so dropping them is safe: the next
+            # request for that domain claims max(now, missing) == now, which
+            # is the same answer the entry would have given.
+            #
+            # This must NOT evict by "is the slot still live". A collected
+            # slot is exactly the case that caused the violation: the domain
+            # comes back, and its gap has to come back with it.
             if len(next_allowed) > 100_000:
-                live = {id(s) for s in self.slots.values()}
-                for key in [k for k in next_allowed if k not in live]:
+                cutoff = dispatched
+                for key in [k for k, v in next_allowed.items() if v <= cutoff]:
                     del next_allowed[key]
 
             request.meta[DISPATCH_TIME] = dispatched

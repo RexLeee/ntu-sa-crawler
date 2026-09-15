@@ -65,6 +65,59 @@ engine 來驗證綁定。
 判斷要不要重跑之前，先看這次的 CPU 數字。主執行緒已經 99%，多 process
 才是主要的槓桿，這個修正是次要的。
 
+## ⚠️⚠️ profile 推翻了原本的診斷
+
+14:00 抓到了。`data/profile.svg`，6,035 個樣本。另有一份 speedscope
+在 `/tmp/prof.speedscope`。兩份獨立的 profile 結論一致。
+
+**CPU 不是花在解析頁面上。一半以上花在 scheduler 的 pop。**
+
+| 佔用 | 位置 |
+|---|---|
+| **50.7%** | `_dqpop` → `DownloaderAwarePriorityQueue.pop` |
+| 31.4% | 其中 `pqueues.stats()` |
+| 9.1% | 其中 `_active_downloads` |
+| 6.5% | 其中 `_next_slot` |
+| 11.8% | `_wait_for_download`，真正的下載 |
+| **5.2%** | `parse`，我以為是主因的那個 |
+| 2.2% | fingerprint |
+| 1.1% | `canonicalize_url` |
+| 1.0% | `_maybe_follow` |
+
+`_start_scheduled_requests` 一個 callback 就佔 52.3%。
+
+**所以「天花板五」才是真正的天花板，不是「天花板四」。**
+README 裡「reactor thread is the fourth ceiling」那一節推論對了結果
+（reactor 執行緒飽和，確實 99%），但**推錯了原因**。我以為是 parse 太慢，
+實際上 parse 只有 5.2%。
+
+### 為什麼我推錯
+
+我從「延遲 p50 13.65 秒 > 逾時 10 秒」推論 response 塞在 scraper 佇列。
+這次跑測的 `scraper_queued` 幾乎整場是 0，`scraper_active_kb` 也很低。
+佇列根本沒塞。事件迴圈是被 pop 佔住，所以**每一件事**都變慢，包括
+connect 完成事件的處理，那才是逾時的來源。
+
+上一輪的推算也偏低了。我預估 3,430 個網域時 pop 只佔 2% 的核心。
+實測 `pqueues` 在 5,000 左右，pop 卻佔 50%。差了 25 倍。原因是
+`stats()` 每次 pop 都對**每個** pqueue 建一個 tuple 進 list，我的
+微基準低估了真實的物件配置成本。
+
+### 這改變了下一步的優先順序
+
+**B2（O(1) 的 pop）從「條件性、第二優先」變成第一優先。**
+它是單 process 就能拿到的 2 倍，而且不需要多 process 的複雜度。
+
+多 process 分片仍然有用，但順序要換：**先修 pop，再看還需不需要分片。**
+修完 pop 之後 CPU 的分布會完全不同，那時再量一次才知道下一個瓶頸在哪。
+
+修法：子類化 `DownloaderAwarePriorityQueue`，覆寫 `pop`。
+不要每次都掃全部 slot。用 deque 輪詢，或維護一個「active=0 的 slot」集合。
+`crawler/scheduler.py` 的 `SCHEDULER_PRIORITY_QUEUE` 指過去。
+
+⚠️ 改完一定要重跑 `ops/verify_politeness.py`。pop 決定哪個網域下一個被爬，
+是靠近政策合規的路徑。
+
 ## 剩下要從這次跑測拿到的東西
 
 | 問題 | 看哪裡 | 判準 |

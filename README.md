@@ -227,7 +227,35 @@ It is now a bounded `LocalCache`. Eviction is safe because a miss re-fetches
 `robots.txt` and waits for it; the check is never skipped. `tests/test_robots_cache.py`
 asserts exactly that, along with the eviction not breaking in-flight fetches.
 
-### The reactor thread is the fourth ceiling
+### The reactor thread is the fourth ceiling, but not for the reason below
+
+> **Corrected 2026-09-15 14:00, by profiling the running crawl.** The section
+> that follows reasons from latency to a conclusion about parsing. The
+> conclusion about the *thread* is right and is now measured directly: main
+> thread at 99% CPU for a full two hours, on a machine with 8 cores. The
+> conclusion about the *cause* is wrong.
+>
+> `py-spy` over 6,035 samples, confirmed by a second independent capture:
+>
+> | Share of CPU | Where |
+> |---|---|
+> | **50.7%** | `_dqpop` → `DownloaderAwarePriorityQueue.pop` |
+> | 31.4% | inside it, `pqueues.stats()` |
+> | 11.8% | actually downloading |
+> | **5.2%** | `parse`, the presumed culprit |
+> | 1.1% | `canonicalize_url` |
+>
+> Parsing is 5% of the work. Picking the next domain is half of it. The
+> scraper queue, which the argument below assumes is backed up, measured
+> empty for almost the entire run.
+>
+> The inference failed in a specific way worth recording: a saturated event
+> loop delays *everything*, so slow page delivery was a symptom of the
+> saturation rather than its cause. Latency told us the loop was busy. Only
+> the profile could say what it was busy with. The fix is the O(domains)
+> `pop()` described in the next section, not a faster parser.
+
+### The original reasoning, kept for the record
 
 Removing the first three raised the rate to 35 pages/s and produced a 63%
 exception rate. The cause is not the network. Both plausible network
@@ -262,20 +290,29 @@ chain and handed to the engine before being dropped. The spider now tests the
 URL against the Bloom filter before building anything, using a fingerprint
 proven identical to Scrapy's in `tests/test_dupefilter.py`.
 
-### pop() is O(domains in the frontier)
+### pop() is O(domains in the frontier), and it is the real ceiling
 
 `DownloaderAwarePriorityQueue.pop()` builds a list over every per-domain queue
 and then scans it. Reproduced on the same `_next_slot` logic:
 
-| Domains in frontier | One pop | Cost at 100 pops/s |
+| Domains in frontier | One pop | Predicted cost at 100 pops/s |
 |---|---|---|
 | 3,430 (28 min) | 0.24 ms | 2% of a core |
 | 10,000 | 0.86 ms | 9% |
 | 35,000 (48 h, projected) | 2.94 ms | **29%** |
 | 100,000 | 8.47 ms | **85%** |
 
-This is invisible in a short run and unavoidable in a long one. It is the
-reason a 28 minute sample cannot be extrapolated to 48 hours on rate alone.
+**The measured cost is far worse than this table predicts.** At roughly 5,000
+queues the profile puts `pop()` at 50.7% of all CPU, where the microbenchmark
+predicted about 4%. The benchmark under-counted allocation: `stats()`
+constructs a tuple per queue on every single call, and that allocation
+dominates once the numbers are real.
+
+So this is not a ceiling that arrives late in a long run. It is the ceiling
+the crawl is already sitting against, and fixing it is worth more than
+sharding across processes because it needs no new failure modes. Sharding
+remains available afterwards; the profile should be re-taken first, since
+removing half the CPU cost will move the bottleneck somewhere new.
 
 `DEPTH_PRIORITY` was also removed here. `_next_slot` chooses purely by active
 download count and never reads request priority, so it could not affect which

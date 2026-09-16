@@ -5,16 +5,21 @@ costs about 131 bytes per URL once object headers, the hash table slot and
 allocator overhead are counted. At the tens of millions of URLs a 48 hour
 broad crawl reaches, that set alone would exceed the machine's memory.
 
-A Bloom filter sized for 50M URLs at a 1e-6 false positive rate costs 171 MB
-instead of roughly 6.5 GB.
+A Bloom filter sized for 100M URLs at a 1e-4 false positive rate costs 240 MB
+instead of roughly 13 GB.
 
 The trade is real and one-directional: a false positive drops a URL that was
-never actually crawled. At 1e-6 over 50M URLs that is roughly 50 lost URLs,
-which is acceptable when the metric is aggregate volume. It would not be
-acceptable if any single URL had to be fetched.
+never actually crawled. At 1e-4 over 100M URLs that is roughly 10,000 lost
+URLs, which is acceptable when the metric is aggregate volume. It would not
+be acceptable if any single URL had to be fetched.
 
 Capacity is a ceiling, not a target. Past it the false positive rate climbs
-sharply, so size for the end of the run rather than its current state.
+sharply, and how sharply depends on the error rate: a tighter rate uses more
+hash functions and degrades faster past capacity. See config.toml [memory]
+for the measured numbers behind the current pair.
+
+The filter is checkpointed on a timer as well as saved at close, so a kill
+loses one interval of dedupe state rather than the whole run.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 
 from rbloom import Bloom
@@ -47,9 +53,10 @@ class BloomDupeFilter(BaseDupeFilter):
     def __init__(
         self,
         path: str | None = None,
-        capacity: int = 50_000_000,
-        error_rate: float = 1e-6,
+        capacity: int = 100_000_000,
+        error_rate: float = 1e-4,
         debug: bool = False,
+        checkpoint_interval: float = 0.0,
         *,
         fingerprinter=None,
     ):
@@ -57,6 +64,8 @@ class BloomDupeFilter(BaseDupeFilter):
         self.debug = debug
         self.logdupes = True
         self._path = Path(path, "requests.bloom") if path else None
+        self._checkpoint_interval = float(checkpoint_interval)
+        self._checkpoint_loop = None
 
         if self._path and self._path.exists():
             self.bloom = Bloom.load(str(self._path), _hash128)
@@ -71,15 +80,51 @@ class BloomDupeFilter(BaseDupeFilter):
         settings = crawler.settings
         obj = cls(
             job_dir(settings),
-            capacity=settings.getint("BLOOM_DUPEFILTER_CAPACITY", 50_000_000),
-            error_rate=settings.getfloat("BLOOM_DUPEFILTER_ERROR_RATE", 1e-6),
+            capacity=settings.getint("BLOOM_DUPEFILTER_CAPACITY", 100_000_000),
+            error_rate=settings.getfloat("BLOOM_DUPEFILTER_ERROR_RATE", 1e-4),
             debug=settings.getbool("DUPEFILTER_DEBUG"),
+            checkpoint_interval=settings.getfloat("BLOOM_CHECKPOINT_INTERVAL", 0.0),
             fingerprinter=crawler.request_fingerprinter,
         )
         # The spider checks URLs against this filter before it builds a
         # Request, so it needs a handle on the same instance.
         crawler.bloom_dupefilter = obj
         return obj
+
+    def open(self) -> None:
+        """Start the periodic save. Called by the scheduler at spider open."""
+        if self._path is None or self._checkpoint_interval <= 0:
+            return
+        from scrapy.utils.asyncio import create_looping_call
+
+        self._checkpoint_loop = create_looping_call(self.checkpoint)
+        self._checkpoint_loop.start(self._checkpoint_interval, now=False)
+
+    def checkpoint(self) -> None:
+        """Write the filter without stopping the crawl.
+
+        A failure here must not take the crawl down: the checkpoint exists to
+        reduce the cost of a crash, so it cannot be allowed to cause one.
+        """
+        try:
+            self._save()
+        except Exception as exc:
+            logger.warning("bloom checkpoint failed: %s", exc)
+
+    def _save(self) -> None:
+        """Persist atomically, so a kill mid-write leaves the previous file.
+
+        rbloom writes the whole filter, 240 MB at the configured capacity. A
+        process killed partway through that write would otherwise leave a
+        truncated file, and Bloom.load on the next start would fail or, worse,
+        succeed on garbage.
+        """
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".bloom.tmp")
+        self.bloom.save(str(tmp))
+        os.replace(tmp, self._path)
 
     def request_seen(self, request) -> bool:
         fp = self.fingerprinter.fingerprint(request)
@@ -132,11 +177,15 @@ class BloomDupeFilter(BaseDupeFilter):
         return False
 
     def close(self, reason: str) -> None:
-        # Only a clean shutdown persists the filter. A kill -9 loses it, and
-        # the crawl would re-fetch what it had already seen.
+        # A clean shutdown saves here. An unclean one keeps whatever the last
+        # checkpoint wrote, which bounds the loss to one interval instead of
+        # the whole run.
+        if self._checkpoint_loop is not None:
+            if getattr(self._checkpoint_loop, "running", False):
+                self._checkpoint_loop.stop()
+            self._checkpoint_loop = None
         if self._path:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self.bloom.save(str(self._path))
+            self._save()
             logger.info("saved bloom filter holding ~%d items", self.bloom.approx_items)
 
     def log(self, request, spider) -> None:

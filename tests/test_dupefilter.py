@@ -166,6 +166,42 @@ def main() -> int:
             f"{len(not_canonical)} not canonical: {not_canonical[:3]}",
         )
 
+        # 5c. A checkpoint must be loadable, and must not leave its temp file
+        # behind. Until this existed only close() saved the filter, so an OOM
+        # kill or a SIGKILL lost the whole run's dedupe state and the restarted
+        # shard re-fetched every request in its resumed frontier.
+        ckpt_dir = tmp + "/ckpt"
+        df5 = BloomDupeFilter(
+            path=ckpt_dir,
+            capacity=100_000,
+            error_rate=1e-9,
+            checkpoint_interval=900,
+            fingerprinter=RequestFingerprinter(),
+        )
+        recorded = [canonical(f"https://ck{i}.example/p") for i in range(50)]
+        for url in recorded:
+            df5.url_seen(url)
+        df5.checkpoint()
+
+        saved = Path(ckpt_dir) / "requests.bloom"
+        check("checkpoint writes the filter", saved.exists())
+        leftover = list(Path(ckpt_dir).glob("*.tmp"))
+        check("checkpoint leaves no temp file", not leftover, str(leftover[:2]))
+
+        # A fresh instance on the same path is what a restart gets.
+        reloaded = BloomDupeFilter(
+            path=ckpt_dir,
+            capacity=100_000,
+            error_rate=1e-9,
+            fingerprinter=RequestFingerprinter(),
+        )
+        missing = [u for u in recorded if not reloaded.url_seen(u)]
+        check(
+            "a restart sees every url the checkpoint held",
+            not missing,
+            f"{len(missing)} of {len(recorded)} lost",
+        )
+
         del df
 
     # 6. The spider must actually hold the filter. Crawler.crawl builds the

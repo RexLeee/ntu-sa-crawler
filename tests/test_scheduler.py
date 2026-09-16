@@ -185,8 +185,37 @@ def test_enqueue_cost_is_flat() -> bool:
     return True
 
 
+def test_the_cap_comes_from_config() -> bool:
+    """The live cap must be the configured one, not a class default.
+
+    The default in from_crawler and the value in config.toml have disagreed
+    before, and the tests above all pass an explicit cap, so nothing checked
+    that the wiring in settings.py was intact. A silent fallback to the
+    default would change how much disk, how many per-domain queues and how
+    many file descriptors the run holds.
+    """
+    from crawler.config import load_config
+    from crawler.settings import FRONTIER_MAX_SIZE
+
+    configured = load_config()["memory"]["frontier_max_size"]
+    if FRONTIER_MAX_SIZE != configured:
+        print(
+            f"FAIL: settings has {FRONTIER_MAX_SIZE}, config.toml has {configured}"
+        )
+        return False
+
+    scheduler = _scheduler(cap=configured)
+    if scheduler._cap != configured:
+        print(f"FAIL: scheduler cap is {scheduler._cap}, expected {configured}")
+        return False
+
+    print(f"PASS: the frontier cap is the configured {configured:,}")
+    return True
+
+
 def main() -> int:
     results = [
+        test_the_cap_comes_from_config(),
         test_size_matches_real_length(),
         test_cap_is_enforced(),
         test_new_domain_bypasses_cap(),

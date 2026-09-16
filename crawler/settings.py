@@ -92,10 +92,14 @@ CONCURRENT_REQUESTS_PER_IP = 0
 JOBDIR = _state["jobdir"]
 
 # RFPDupeFilter holds every fingerprint in a set at roughly 131 bytes each,
-# which is about 6.5 GB at 50M URLs. The Bloom filter costs 171 MB instead.
+# which is about 13 GB at 100M URLs. The Bloom filter costs 240 MB instead.
 DUPEFILTER_CLASS = "crawler.dupefilter.BloomDupeFilter"
 BLOOM_DUPEFILTER_CAPACITY = _mem["bloom_capacity"]
 BLOOM_DUPEFILTER_ERROR_RATE = _mem["bloom_error_rate"]
+# Without this only a clean close persists the filter, so an OOM kill or a
+# SIGKILL loses the whole run's dedupe state and the restarted shard re-fetches
+# its entire frontier.
+BLOOM_CHECKPOINT_INTERVAL = _mem["bloom_checkpoint_interval"]
 
 # Nothing in Scrapy caps the frontier, so a breadth-first crawl fills it about
 # 33x faster than it drains. This is the backstop.

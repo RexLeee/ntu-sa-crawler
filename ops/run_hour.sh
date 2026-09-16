@@ -71,7 +71,12 @@ SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-30}"
 SHUTDOWN_GRACE="${SHUTDOWN_GRACE:-600}"
 # Abort rather than let the disk fill. A full disk fails the gzip writers and
 # the JOBDIR write path at once, which kills both shards mid-run.
-MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-3000}"
+#
+# 8000, not 3000. The low-disk path's first action is collect(), which copies
+# every log into the run directory ON THE SAME FILESYSTEM. A 48 hour run's
+# logs are several GB, so a 3000 MB reserve was not even enough for the
+# handler itself: it would fill the disk it was trying to protect.
+MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-8000}"
 # A shard that dies is restarted on the same JOBDIR, so it resumes its frontier
 # and its Bloom filter. The cap stops a crash loop from running all night.
 MAX_RESTARTS="${MAX_RESTARTS:-10}"
@@ -82,6 +87,13 @@ RESUME="${RESUME:-0}"
 # never disagree about how many shards exist.
 SHARDS="${SHARDS:-$(grep -E '^shards[[:space:]]*=' config.toml | head -1 | tr -dc '0-9')}"
 SHARDS="${SHARDS:-1}"
+# How long to wait before restarting a shard. This is a politeness interval,
+# not a backoff: the limiter's and the guard's per-domain history are process
+# memory, so a restarted shard would otherwise dispatch to every domain in its
+# resumed frontier immediately. Read from config.toml so it tracks
+# max_crawl_delay, which is the largest gap any domain can require.
+RESTART_PAUSE="${RESTART_PAUSE:-$(grep -E '^restart_pause[[:space:]]*=' config.toml | head -1 | tr -dc '0-9.')}"
+RESTART_PAUSE="${RESTART_PAUSE:-60}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 RUNDIR="data/run-${STAMP}"
 mkdir -p "$RUNDIR"
@@ -178,7 +190,7 @@ SUPERVISOR_LOG="$RUNDIR/supervisor.log"
 : > "$SUPERVISOR_LOG"
 
 run_shard() {
-    local i="$1" restarts=0 started elapsed remaining rc
+    local i="$1" restarts=0 started elapsed remaining rc ran sfx reason
     local jobdir="state/job-${i}"
     local shard_started
     shard_started=$(date +%s)
@@ -199,15 +211,39 @@ run_shard() {
         rc=$?
         set -e
 
-        # A clean stop leaves at least 30s unused only if it ran its full
-        # remaining time, so treat rc 0 as done regardless of the clock.
+        ran=$(( $(date +%s) - started ))
+        # rc=0 is not the same as "the run is done". Scrapy's MemoryUsage
+        # extension closes the spider cleanly when MEMUSAGE_LIMIT_MB is hit,
+        # which exits 0 with finish_reason=memusage_exceeded. Treating that as
+        # completion would have ended a 48 hour run at whatever hour the first
+        # shard filled up, and it is in fact the ideal moment to restart: the
+        # bloom filter is saved, the frontier is on disk, and a fresh process
+        # starts with an empty robots cache.
         if [ "$rc" -eq 0 ]; then
-            echo "$(date -Iseconds) shard=$i exited cleanly rc=0" >> "$SUPERVISOR_LOG"
-            return 0
+            if [ "$SHARDS" -gt 1 ]; then sfx="-${i}"; else sfx=""; fi
+            reason=$(sed -n 's/.*"finish_reason": "\([^"]*\)".*/\1/p' \
+                "data/stats${sfx}.json" 2>/dev/null | head -1 || true)
+            if [ "$reason" = "run_duration" ] || [ -z "$reason" ]; then
+                echo "$(date -Iseconds) shard=$i exited cleanly rc=0 reason=${reason:-unknown}" \
+                    >> "$SUPERVISOR_LOG"
+                return 0
+            fi
+            restarts=$((restarts + 1))
+            echo "$(date -Iseconds) shard=$i closed itself reason=$reason after ${ran}s, restart $restarts/$MAX_RESTARTS" \
+                >> "$SUPERVISOR_LOG"
+            if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+                echo "$(date -Iseconds) shard=$i giving up after $restarts restarts" \
+                    >> "$SUPERVISOR_LOG"
+                return 1
+            fi
+            # Resume rather than cold start: the frontier and the bloom filter
+            # are exactly what this shard should keep. Only the politeness
+            # pause applies.
+            sleep "$RESTART_PAUSE"
+            continue
         fi
 
         restarts=$((restarts + 1))
-        local ran=$(( $(date +%s) - started ))
         echo "$(date -Iseconds) shard=$i died rc=$rc after ${ran}s, restart $restarts/$MAX_RESTARTS" \
             >> "$SUPERVISOR_LOG"
 
@@ -225,7 +261,8 @@ run_shard() {
                 >> "$SUPERVISOR_LOG"
             mv "$jobdir" "${jobdir}.broken-$(date +%s)" 2>/dev/null || true
         fi
-        sleep 5
+        # Politeness, not backoff. See RESTART_PAUSE above.
+        sleep "$RESTART_PAUSE"
     done
 }
 
@@ -455,9 +492,17 @@ for i in $(seq 0 $((SHARDS - 1))); do
         echo "shard $i     : $FOREIGN foreign url(s) arrived in the handoff inbox"
     fi
 done
+# A self-close restart (finish_reason=memusage_exceeded) is a healthy event:
+# the shard saved its state and a fresh process took over. A crash (rc != 0)
+# is not. The two used to be reported identically, so distinguish them.
 if [ -s "$SUPERVISOR_LOG" ]; then
-    echo "restarts     : see $SUPERVISOR_LOG"
+    CRASHES=$(grep -c "died rc=" "$SUPERVISOR_LOG" || true)
+    SELFCLOSE=$(grep -c "closed itself" "$SUPERVISOR_LOG" || true)
+    echo "restarts     : ${CRASHES:-0} crash, ${SELFCLOSE:-0} self-close (see $SUPERVISOR_LOG)"
     cat "$SUPERVISOR_LOG"
+    if [ "${CRASHES:-0}" != "0" ]; then
+        UNCLEAN=1
+    fi
 else
     echo "restarts     : none"
 fi

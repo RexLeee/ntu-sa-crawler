@@ -52,6 +52,9 @@ design this cannot happen, so the guard should never fire: it exists because
 "should never" has been wrong three times on this crawl, and losing one page
 is cheaper than one violation. dispatch/guard_refused is asserted to be 0 in
 the smoke acceptance list.
+
+The guard measures in monotonic time and the log records wall clock. See the
+_last_out comment for why the two cannot be the same clock over 48 hours.
 """
 
 from __future__ import annotations
@@ -94,6 +97,15 @@ _stats = None
 # different domain. A 10 minute run produced six violations that way, every
 # one of them invisible because the timer believed it was looking at the
 # source domain's history.
+#
+# Monotonic, not wall clock. The limiter in crawler/downloader.py spaces
+# requests in monotonic time, so the guard has to check the same quantity or
+# the two disagree whenever the clocks diverge. Over 48 hours chronyd will
+# step the wall clock at least once: a backward step would fabricate a short
+# gap, write a trace entry and fail the run's own compliance evidence, and a
+# forward step would hide a real one. The wall-clock stamp is still what goes
+# into the dispatch log and request.meta, because that is what
+# ops/verify_politeness.py reads offline.
 _last_out: dict[str, float] = {}
 _LAST_OUT_MAX = 100_000
 
@@ -201,13 +213,16 @@ def record_dispatch(request) -> None:
     statement opens a socket: there is no safe way to continue.
     """
     dispatched = time.time()
+    # The quantity the guard compares. See the _last_out comment for why this
+    # is not the wall clock.
+    elapsed = time.monotonic()
     # Derived from the URL, never read from meta. See the _last_out comment.
     slot_id = slot_key(request.url)
 
     if _min_gap > 0:
         previous = _last_out.get(slot_id)
         if previous is not None:
-            observed = dispatched - previous
+            observed = elapsed - previous
             # 0.05s of slack, matching ops/verify_politeness.py, so the guard
             # and the offline check agree on the verdict for every pair.
             if observed < _min_gap - 0.05:
@@ -239,10 +254,10 @@ def record_dispatch(request) -> None:
         # exactly the case that caused an earlier violation: the domain comes
         # back, and its history has to come back with it.
         if len(_last_out) > _LAST_OUT_MAX:
-            stale = dispatched - _min_gap
+            stale = elapsed - _min_gap
             for key in [k for k, v in _last_out.items() if v <= stale]:
                 del _last_out[key]
-        _last_out[slot_id] = dispatched
+        _last_out[slot_id] = elapsed
 
     request.meta[DISPATCH_TIME] = dispatched
     if _dispatch_log is not None:

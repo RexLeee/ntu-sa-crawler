@@ -9,9 +9,22 @@ drains and memory tracks it linearly.
 A measured hour: 40,773 pages crawled against 1.4M URLs discovered, with RSS
 rising 1.6 MB/s and no sign of flattening.
 
-Dropped requests are deliberately not marked as seen. They can be
-rediscovered later when there is room, which costs a little CPU and keeps the
-crawl correct.
+What a drop costs, precisely
+----------------------------
+A dropped URL is gone. The spider's _admit() records it in the Bloom filter
+before it builds the Request, so a URL this scheduler refuses will be filtered
+out if it is ever linked again. The older comment here claimed the opposite.
+
+Neither reported metric suffers for it:
+
+  * discovered/unique is written in _admit(), before the scheduler sees the
+    request, so a drop does not reduce it.
+  * crawled is bounded by active domains / delay, not by frontier depth. A
+    measured hour dequeued 6.6% of what it enqueued, so the URLs beyond the
+    cap were never going to be fetched in the time available.
+
+The one drop that would hurt is the first URL of an unseen domain, because
+domain count is what sets the throughput ceiling. enqueue_request exempts it.
 """
 
 from __future__ import annotations
@@ -42,7 +55,7 @@ class CappedScheduler(Scheduler):
     @classmethod
     def from_crawler(cls, crawler):
         obj = super().from_crawler(crawler)
-        obj._cap = crawler.settings.getint("FRONTIER_MAX_SIZE", 500_000)
+        obj._cap = crawler.settings.getint("FRONTIER_MAX_SIZE", 3_000_000)
         obj._size = 0
         obj._warned = False
         # The runstats extension reads _size and the per-domain queue count
@@ -67,7 +80,12 @@ class CappedScheduler(Scheduler):
         # an unseen domain is worth more than any number of extra pages on a
         # domain already held. Dropping it because the frontier is full would
         # freeze domain growth, which is the one curve that sets the ceiling.
-        # A measured run filled a 2M frontier in about an hour.
+        #
+        # The exemption is unbounded by design, and that is safe here because
+        # it fires at most once per domain: _admit() sets new_domain only when
+        # the domain is absent from seen_domains, which never forgets. So the
+        # frontier can exceed the cap by at most the number of domains still
+        # to be discovered, one request each.
         if self._size >= self._cap and not request.meta.get("new_domain"):
             if not self._warned:
                 logger.info(

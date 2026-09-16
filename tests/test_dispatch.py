@@ -333,6 +333,97 @@ def test_guard_refuses_a_short_gap() -> int:
     return 1 if failures else 0
 
 
+def test_a_wall_clock_step_does_not_fake_a_violation() -> int:
+    """The guard must measure in monotonic time, not wall clock.
+
+    The limiter in crawler/downloader.py spaces requests in monotonic time. If
+    the guard checks the wall clock, the two disagree whenever the clocks do,
+    and over 48 hours chronyd will step the wall clock at least once.
+
+    Both directions are wrong and both matter:
+
+      * A backward step would make the guard see a short gap that never
+        happened. It would drop the page, count dispatch/guard_refused and
+        write to violation-trace, which are the three things the acceptance
+        list reads as proof of a violation. The run would fail its own
+        evidence check with no violation having occurred.
+      * A forward step would hide a real short gap.
+
+    The dispatch log and request.meta keep the wall-clock stamp, because that
+    is what ops/verify_politeness.py reads offline.
+    """
+    import time as time_mod
+    import types
+
+    from scrapy.exceptions import IgnoreRequest
+
+    from crawler import dispatch as mod
+
+    failures = 0
+    mod.configure(5.0, None, None)
+
+    class _Req:
+        def __init__(self, url):
+            self.url = url
+            self.meta = {}
+
+    # A dispatch, then the wall clock jumps back an hour while monotonic time
+    # advances the full delay. The gap is real; only the wall clock disagrees.
+    first = _Req("https://step.test/a")
+    mod.record_dispatch(first)
+
+    base_wall = time_mod.time()
+    base_mono = time_mod.monotonic()
+
+    def _fake_clock(wall: float, mono: float):
+        """A stand-in for the time module, swapped into dispatch only.
+
+        Patching time.time globally would change the clock for every other
+        module in the interpreter, including the test runner.
+        """
+        fake = types.SimpleNamespace()
+        fake.time = lambda: wall
+        fake.monotonic = lambda: mono
+        return fake
+
+    real_module = mod.time
+    try:
+        mod.time = _fake_clock(base_wall - 3600.0, base_mono + 6.0)
+        second = _Req("https://step.test/b")
+        try:
+            mod.record_dispatch(second)
+        except IgnoreRequest:
+            print("FAIL [clock]: a backward wall-clock step faked a violation")
+            failures += 1
+        else:
+            print("PASS [clock]: a backward wall-clock step did not fake a violation")
+
+        # The log and meta must still carry wall clock, or the offline check
+        # cannot read them.
+        stamp = second.meta.get(DISPATCH_TIME)
+        if stamp is None or abs(stamp - (base_wall - 3600.0)) > 1.0:
+            print(f"FAIL [clock]: meta stamp is {stamp}, expected the wall clock")
+            failures += 1
+        else:
+            print("PASS [clock]: the recorded stamp is still wall clock")
+
+        # And a forward wall-clock step must not hide a real short gap:
+        # monotonic barely moves, so the guard must still refuse.
+        mod.time = _fake_clock(base_wall + 7200.0, base_mono + 6.1)
+        third = _Req("https://step.test/c")
+        try:
+            mod.record_dispatch(third)
+        except IgnoreRequest:
+            print("PASS [clock]: a forward step did not hide a short gap")
+        else:
+            print("FAIL [clock]: a forward wall-clock step hid a short gap")
+            failures += 1
+    finally:
+        mod.time = real_module
+
+    return 1 if failures else 0
+
+
 def test_key_comes_from_the_url_not_meta() -> int:
     """The guard must group by the URL's domain, never by meta.
 
@@ -370,12 +461,14 @@ def main() -> int:
         return test_guard_refuses_a_short_gap()
     if len(sys.argv) == 2 and sys.argv[1] == "key":
         return test_key_comes_from_the_url_not_meta()
+    if len(sys.argv) == 2 and sys.argv[1] == "clock":
+        return test_a_wall_clock_step_does_not_fake_a_violation()
     if len(sys.argv) > 1:
         return run_scenario(sys.argv[1])
 
     # Parent: run each scenario in its own interpreter.
     failures = 0
-    for name in [*SCENARIOS, "guard", "key"]:
+    for name in [*SCENARIOS, "guard", "key", "clock"]:
         result = subprocess.run([sys.executable, __file__, name], check=False)
         failures += result.returncode != 0
     return 1 if failures else 0

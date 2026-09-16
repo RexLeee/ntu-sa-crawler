@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import sys
 import time
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -44,15 +45,28 @@ def read_lines(path: Path | str) -> Iterator[str]:
     """Yield log lines, tolerating a file the writer never closed.
 
     The writer flushes periodically so a killed run keeps its records, but the
-    final gzip member then has no end-of-stream marker and the stdlib raises
-    EOFError at the end. Every line decoded before that point is a real record,
-    so the analysis tools must report on them rather than refuse the file.
+    tail of the file is then whatever the kill interrupted. Every line decoded
+    before that point is a real record, so the analysis tools must report on
+    them rather than refuse the file.
+
+    Three different exceptions mean the same thing, and catching only the
+    first one made every report tool fail on the one run that most needed
+    them. A SIGKILLed writer left a half-written deflate block, so
+    report_metrics, report_timeline, report_growth, verify_politeness and
+    verify_robots all ended in a traceback:
+
+      EOFError          a member with no end-of-stream marker
+      zlib.error        a corrupt deflate block, which is what SIGKILL leaves
+      gzip.BadGzipFile  a member header cut in half
     """
     try:
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             yield from fh
-    except EOFError:
-        print(f"{path}: truncated, using the decoded prefix", file=sys.stderr)
+    except (EOFError, zlib.error, gzip.BadGzipFile) as exc:
+        print(
+            f"{path}: unclean end ({type(exc).__name__}), using the decoded prefix",
+            file=sys.stderr,
+        )
 
 
 def now() -> float:

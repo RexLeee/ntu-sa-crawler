@@ -255,6 +255,33 @@ frontier 到 `frontier_max_size`（3M）之後，`pqueues` 與 `fds` 都必須�
 繼續線性上升就是上限沒生效。`scheduler/dropped/over_capacity` 大於 0
 才證明上限真的在作用。
 
+兩小時 run 證明「frontier 持平」不等於「pqueues 持平」。請求數釘在 3,000,810，
+queue 數還是從 46,788 長到 132,779，因為新 domain 的第一個 URL 豁免請求上限。
+所以要另外看 queue 數的上限：
+
+```bash
+grep -o '"scheduler/dropped/over_queues": [0-9]*' data/run-*/stats-*.json
+for f in data/runstats-*.tsv; do tail -1 $f | cut -f15; done   # 必須停在 40,000
+awk -F'\t' 'NR>1{if($10>a)a=$10; if($11>b)b=$11} END{print a/1024, b/1024}' \
+  data/run-*/resources.tsv                                    # 每個 shard < 2,400 MB
+```
+
+被 kill 之後必須能續跑。這是兩小時 run 最嚴重的缺陷，重啟的 process
+讀到空的 frontier，1.66 秒就結束：
+
+```bash
+grep -E "resumed a frontier of|rebuilt .*active.json" data/run-*/scrapy-*.log
+ls data/run-*/stats*.restart*.json        # 有重啟才會有，內容是死掉那一輪
+ls -d state/job-*.broken-*                # 不該存在；存在代表 frontier 被丟掉
+find state/job-0/requests.queue -name info.json | head -3   # run 中途就要有
+```
+
+- 重啟後第一列 runstats 的 `frontier` 要接近被殺前的值，不能是 0。
+- `supervisor.log` 的 `stopped itself ... not restarting` 是 `finished`，
+  那不是缺陷，但它代表那個 shard 提早沒工作了，要在報告裡說明。
+- 磁碟速率要在上限生效之後才量，而且要用 30 分鐘以上的區間：
+  兩個 shard 合計應低於 500 MB/h。用整場平均會把填充期混進來。
+
 還要看兩個東西，兩個都必須是空的：
 
 - `data/violation-trace-*.log` **必須是 0 bytes**。

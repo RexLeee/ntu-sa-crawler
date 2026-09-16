@@ -32,11 +32,16 @@ core. On t2d the link is not the constraint: 12.0 Mbps used against 1,570
 available, 0.8%. The reactor is, and two dedicated cores let two shards run at
 53.09 pages/s against 25.51 for one, a 2.08x gain.
 
-The disqualifying reason is memory. `memory.memusage_limit_mb` is 3000 **per
-process**, so two shards need 6 GB before the guard fires. On a 4 GB e2-medium
-the guard could never fire and the OOM killer would arrive first, which is the
-exact failure `config.toml` sizes that limit to avoid: a SIGKILL loses the log
-flush and the persisted dupefilter.
+The disqualifying reason is memory. `memory.memusage_limit_mb` is 2800 **per
+process**, so two shards need 5.6 GB before the guard fires, plus page cache
+and the kernel's own slab for tens of thousands of open descriptors. On a 4 GB
+e2-medium the guard could never fire and the OOM killer would arrive first.
+
+That is not hypothetical. It happened on this machine at the previous limit of
+3400: the kernel killed shard 0 at 3,110 MB while the guard, set above the
+real ceiling, had never fired once. A SIGKILL loses the log flush, and it used
+to lose the frontier as well. Both are now recoverable, but a clean self-close
+is still much cheaper than a kill.
 
 **Do not use a Spot instance.** Spot VMs terminate at 24 hours whatever
 happens, so a 48 hour run is guaranteed to be cut in half. The saving is
@@ -90,14 +95,37 @@ JOBDIR.** Counting the frontier once was an error that hid 13 GB.
 
 | | |
 |---|---|
-| Frontier ceiling, 2 x `state/job-N` | 4.0 GB |
+| Frontier, live requests, 2 x `state/job-N` | 4.0 GB |
+| Frontier, dead bytes not yet reclaimed, 190 MB/h x 2 x 48 h | 17.8 GB |
+| Domain queue directories, 2 x 40,000 x ~12 KB | 1.0 GB |
 | Logs, gzipped, at 53 pages/s | 7.3 GB |
 | `dispatched.log.gz`, all requests | 1.0 GB |
 | Handoff inbox, 2 senders x 2 segments | 0.3 GB |
 | Bloom filters, 2 x 240 MB | 0.5 GB |
 | `collect()` copy into `data/run-<stamp>/` | 8.3 GB |
 | OS, uv, venv | 8 GB |
-| **Total** | **29.4 GB** |
+| **Total** | **48.2 GB** |
+
+The two new frontier lines are the ones that made the 2 hour run's disk rate
+look inexplicable. A popped request does not free its bytes: queuelib unlinks
+a chunk only when a whole chunk drains (`chunksize` is 100,000 records, which
+a per-domain queue never reaches) or when the queue empties entirely. So the
+frontier files keep growing at the pop rate even after the request cap binds.
+
+Measured in three separate regimes rather than averaged, which is what made
+the mechanism visible:
+
+| | |
+|---|---|
+| filling, both shards | ~5,150 MB/h |
+| at the request cap, both shards | 2,131 MB/h |
+| at the request cap, one shard | 190 MB/h |
+
+The 4,529 MB/h headline was the filling phase and unbounded queue-directory
+growth mixed together. 190 MB/h per shard is the steady state, and it is the
+number the table now budgets. It leaves 11.8 GB spare on the 60 GB disk, which
+is thin enough that `MIN_DISK_FREE_MB` matters: the run stops itself rather
+than failing the writers.
 
 The log figures come from a real run: `discovered.log.gz` held 4,075,529 lines
 in 43,961,228 bytes, so a discovered URL costs 10.79 bytes compressed and a
@@ -241,7 +269,8 @@ tail -1 data/runstats.tsv                 # main_cpu_pct, requests, responses
 |---|---|---|
 | **Response rate** | `responses / requests` in `runstats.tsv` | **Below 30% means do not migrate** |
 | Main thread CPU | `main_cpu_pct` | Near 99% means the link is no longer the ceiling |
-| RSS | `resources.tsv` | Per shard under the 2,500 MB warning, and the total well under the machine's 7.9 GB |
+| RSS | `resources.tsv` | Per shard under the 2,400 MB warning, and the total well under the machine's 7.9 GB. Report peaks and ranges, never a short-window slope |
+| Domain queues | `runstats-*.tsv` `pqueues` | Plateaus at `pqueue_max` (40,000), with `scheduler/dropped/over_queues` above 0 to prove the cap binds |
 | Compliance | both verifiers | 0 and 0 |
 
 Response rate is the decision. Published figures put datacenter IP success at
@@ -357,7 +386,7 @@ releases the disk and the ephemeral IP together.
 |---|---|---|
 | `ops/run_hour.sh` | `ulimit -n` takes `ulimit -Hn` instead of 1,000,000 | A bare `ulimit` to a value above the host's ceiling returns non-zero and `set -e` kills the run before the first page |
 | `ops/run_hour.sh` | Exports `TLDEXTRACT_CACHE` under `state/` | Keeps domain keying identical across runs; see the warm-up section |
-| `config.toml` | `memusage_limit_mb` 7000 to 3000, warning 5500 to 2500 | The value is per process. At `shards = 2` on a 7.9 GB machine anything above 3000 puts the combined limit over physical RAM, so the OOM killer would act first and the guard would never fire |
+| `config.toml` | `memusage_limit_mb` 7000 to 3000, then 3400, now **2800**; warning now 2400 | The value is per process, so at `shards = 2` the combined limit has to clear physical RAM with room for page cache and kernel slab. 3400 did not: the OOM killer took shard 0 at 3,110 MB while the guard had never fired. See the README section on the queue count |
 | `config.toml` | `shards` 1 to 2 | The link is 0.8% used on this machine, so the condition the old note set for sharding is met. See "Why two shards" below |
 | `crawler/dupefilter.py` | `url_seen()` no longer calls `canonicalize_url` | Its caller passes a `UrlFilter.normalize()` result, which is already canonical. The second call cost 10.77 us of the method's 12.79 us and could not change the value |
 | `ops/run_hour.sh` | Shutdown grace 20s to 90s | Every run so far was SIGKILLed before Scrapy wrote `Dumping Scrapy stats`, which is the only source of `exception_type_count` |

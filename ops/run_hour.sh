@@ -189,8 +189,27 @@ cp "$SEEDS" "$RUNDIR/seeds_used.txt" 2>/dev/null || true
 SUPERVISOR_LOG="$RUNDIR/supervisor.log"
 : > "$SUPERVISOR_LOG"
 
+# Move the dying round's stats dump aside before the replacement overwrites it.
+# runstats.py rewrites data/stats-N.json every 30s, so a restarted shard
+# replaced the record of the round that died: after a measured run
+# data/stats-0.json was 624 bytes describing a 1.66 second restart, and the
+# real numbers for the 3,771 seconds before it survived only in runstats-0.tsv.
+keep_stats() {
+    local i="$1" sfx="$2" n="$3"
+    mv "data/stats${sfx}.json" "$RUNDIR/stats${sfx}.restart${n}.json" 2>/dev/null || true
+}
+
+# A shard that exhausts its restarts leaves a marker. The sampler loop reads
+# these rather than inferring an abort from "a supervisor exited", because a
+# supervisor now also exits when its shard legitimately finishes early.
+gave_up() {
+    local i="$1" n="$2"
+    echo "$(date -Iseconds) shard=$i giving up after $n restarts" >> "$SUPERVISOR_LOG"
+    touch "$RUNDIR/shard-${i}.gaveup"
+}
+
 run_shard() {
-    local i="$1" restarts=0 started elapsed remaining rc ran sfx reason
+    local i="$1" restarts=0 fast_crashes=0 started elapsed remaining rc ran sfx reason
     local jobdir="state/job-${i}"
     local shard_started
     shard_started=$(date +%s)
@@ -212,15 +231,23 @@ run_shard() {
         set -e
 
         ran=$(( $(date +%s) - started ))
-        # rc=0 is not the same as "the run is done". Scrapy's MemoryUsage
-        # extension closes the spider cleanly when MEMUSAGE_LIMIT_MB is hit,
-        # which exits 0 with finish_reason=memusage_exceeded. Treating that as
-        # completion would have ended a 48 hour run at whatever hour the first
-        # shard filled up, and it is in fact the ideal moment to restart: the
-        # bloom filter is saved, the frontier is on disk, and a fresh process
-        # starts with an empty robots cache.
+        if [ "$SHARDS" -gt 1 ]; then sfx="-${i}"; else sfx=""; fi
+
+        # rc=0 is not the same as "the run is done", and it is not the same as
+        # "restart it" either. Three outcomes, distinguished by finish_reason:
+        #
+        #   run_duration        the shard reached its deadline. Done.
+        #   memusage_exceeded   the guard closed it cleanly with work left.
+        #                       The ideal moment to restart: the bloom filter
+        #                       is saved, the frontier is on disk, and the new
+        #                       process starts with an empty robots cache.
+        #   anything else       most importantly `finished`, which is Scrapy's
+        #                       "the engine has no work left". Restarting that
+        #                       just reproduces it. A measured run burned all
+        #                       10 restarts in 30 seconds doing exactly that,
+        #                       then tripped the early-exit path and ended the
+        #                       whole run 47 minutes short.
         if [ "$rc" -eq 0 ]; then
-            if [ "$SHARDS" -gt 1 ]; then sfx="-${i}"; else sfx=""; fi
             reason=$(sed -n 's/.*"finish_reason": "\([^"]*\)".*/\1/p' \
                 "data/stats${sfx}.json" 2>/dev/null | head -1 || true)
             if [ "$reason" = "run_duration" ] || [ -z "$reason" ]; then
@@ -228,14 +255,19 @@ run_shard() {
                     >> "$SUPERVISOR_LOG"
                 return 0
             fi
+            if [ "$reason" != "memusage_exceeded" ]; then
+                echo "$(date -Iseconds) shard=$i stopped itself reason=$reason after ${ran}s, not restarting" \
+                    >> "$SUPERVISOR_LOG"
+                return 0
+            fi
             restarts=$((restarts + 1))
             echo "$(date -Iseconds) shard=$i closed itself reason=$reason after ${ran}s, restart $restarts/$MAX_RESTARTS" \
                 >> "$SUPERVISOR_LOG"
             if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
-                echo "$(date -Iseconds) shard=$i giving up after $restarts restarts" \
-                    >> "$SUPERVISOR_LOG"
+                gave_up "$i" "$restarts"
                 return 1
             fi
+            keep_stats "$i" "$sfx" "$restarts"
             # Resume rather than cold start: the frontier and the bloom filter
             # are exactly what this shard should keep. Only the politeness
             # pause applies.
@@ -248,18 +280,32 @@ run_shard() {
             >> "$SUPERVISOR_LOG"
 
         if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
-            echo "$(date -Iseconds) shard=$i giving up after $restarts restarts" \
-                >> "$SUPERVISOR_LOG"
+            gave_up "$i" "$restarts"
             return 1
         fi
+        keep_stats "$i" "$sfx" "$restarts"
 
-        # Dying twice inside two minutes means the state it resumes from is the
-        # problem, not the crawl. Move it aside and let the shard cold start;
-        # losing one shard's frontier beats losing the shard.
+        # A frontier is now recoverable after a kill, so discarding one costs
+        # real work: crawler/scheduler.py rebuilds active.json from the
+        # directories and crawler/squeue.py rescans each queue. This rule used
+        # to fire on the FIRST fast crash despite its own comment saying
+        # "twice", and in testing it threw away a resumable frontier of 4,769
+        # domain queues immediately after a SIGKILL.
+        #
+        # So it now takes three consecutive fast crashes, which is the pattern
+        # that means the state itself is unreadable rather than the machine
+        # being under pressure. An OOM kill arrives as one fast crash, and the
+        # right response to that is to resume, not to start over.
         if [ "$ran" -lt 120 ]; then
-            echo "$(date -Iseconds) shard=$i died in ${ran}s, moving $jobdir aside" \
+            fast_crashes=$((fast_crashes + 1))
+        else
+            fast_crashes=0
+        fi
+        if [ "$fast_crashes" -ge 3 ]; then
+            echo "$(date -Iseconds) shard=$i died in under 120s three times, moving $jobdir aside" \
                 >> "$SUPERVISOR_LOG"
             mv "$jobdir" "${jobdir}.broken-$(date +%s)" 2>/dev/null || true
+            fast_crashes=0
         fi
         # Politeness, not backoff. See RESTART_PAUSE above.
         sleep "$RESTART_PAUSE"
@@ -342,16 +388,6 @@ any_alive() {
     return 1
 }
 
-# A shard that exits while the others run used to be invisible. The supervisor
-# restarts a crash, so a dead supervisor means it gave up or finished.
-all_alive() {
-    local pid
-    for pid in "${PIDS[@]}"; do
-        kill -0 "$pid" 2>/dev/null || return 1
-    done
-    return 0
-}
-
 disk_free_mb() {
     df -Pm . 2>/dev/null | awk 'NR==2{print $4+0}'
 }
@@ -373,12 +409,19 @@ disk_free_mb() {
             echo "sampler deadline reached (${DEADLINE}s)" >&2
             break
         fi
-        # A supervisor that exits before the duration has given up on its
-        # shard. Nothing used to notice; the run continued at half capacity.
-        if ! all_alive && [ $((NOW - START)) -lt "$DURATION" ]; then
-            echo "$(date -Iseconds) a shard supervisor exited early, stopping the run" \
+        # Stop the whole run only when a shard exhausted its restarts. A
+        # supervisor exiting is no longer proof of that: it also exits when
+        # its shard closes itself for a reason that must not be restarted,
+        # such as `finished`. Killing the run then would throw away the other
+        # shard's remaining hours for no reason, and the report is built from
+        # the logs, so a run that finishes with one shard is still reportable.
+        if ls "$RUNDIR"/shard-*.gaveup >/dev/null 2>&1; then
+            echo "$(date -Iseconds) a shard exhausted its restarts, stopping the run" \
                 >> "$SUPERVISOR_LOG"
-            echo "a shard supervisor exited early; see $SUPERVISOR_LOG" >&2
+            echo "a shard exhausted its restarts; see $SUPERVISOR_LOG" >&2
+            break
+        fi
+        if ! any_alive; then
             break
         fi
         FREE_MB=$(disk_free_mb)
@@ -494,17 +537,29 @@ for i in $(seq 0 $((SHARDS - 1))); do
 done
 # A self-close restart (finish_reason=memusage_exceeded) is a healthy event:
 # the shard saved its state and a fresh process took over. A crash (rc != 0)
-# is not. The two used to be reported identically, so distinguish them.
+# is not, and a shard that gave up is worse. All three used to be reported
+# identically, so distinguish them.
 if [ -s "$SUPERVISOR_LOG" ]; then
     CRASHES=$(grep -c "died rc=" "$SUPERVISOR_LOG" || true)
     SELFCLOSE=$(grep -c "closed itself" "$SUPERVISOR_LOG" || true)
-    echo "restarts     : ${CRASHES:-0} crash, ${SELFCLOSE:-0} self-close (see $SUPERVISOR_LOG)"
+    EARLY=$(grep -c "stopped itself" "$SUPERVISOR_LOG" || true)
+    echo "restarts     : ${CRASHES:-0} crash, ${SELFCLOSE:-0} self-close, ${EARLY:-0} stopped early (see $SUPERVISOR_LOG)"
     cat "$SUPERVISOR_LOG"
     if [ "${CRASHES:-0}" != "0" ]; then
         UNCLEAN=1
     fi
 else
     echo "restarts     : none"
+fi
+# The stats dump of any round that was restarted. The live stats-N.json only
+# ever describes the LAST round, so without these a restarted shard's real
+# numbers would exist nowhere but the runstats TSV.
+if ls "$RUNDIR"/stats*.restart*.json >/dev/null 2>&1; then
+    echo "kept stats   : $(ls "$RUNDIR"/stats*.restart*.json | tr '\n' ' ')"
+fi
+if ls "$RUNDIR"/shard-*.gaveup >/dev/null 2>&1; then
+    echo "GAVE UP      : $(ls "$RUNDIR"/shard-*.gaveup | tr '\n' ' ')"
+    UNCLEAN=1
 fi
 for f in data/violation-trace*.log; do
     [ -e "$f" ] || continue

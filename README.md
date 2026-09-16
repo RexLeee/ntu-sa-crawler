@@ -264,6 +264,96 @@ worth keeping and the new process starts with an empty robots cache.
 The close check reports crash restarts and self-close restarts separately.
 Only a crash is a defect.
 
+There is a third outcome, and treating it as the second one ended a run 47
+minutes early. `finished` is Scrapy's reason for "the engine has no work
+left". Restarting on it just reproduces it: a measured run spent all ten
+restarts in 30 seconds, then tripped the early-exit path and stopped the
+other shard too. The supervisor now restarts only on `memusage_exceeded`,
+records anything else as `stopped itself ... not restarting`, and stops the
+whole run only when a shard exhausts its restarts.
+
+A restart also used to erase the evidence of the round that died. `stats-N.json`
+is rewritten every 30 seconds, so the replacement process overwrote it: after
+one run that file was 624 bytes describing a 1.66 second restart, while the
+3,771 seconds before it survived only in the runstats TSV. Each restart now
+moves the old dump to `stats-N.restartK.json` first.
+
+### A kill left a frontier the scheduler could not see
+
+A shard that is OOM-killed keeps its frontier on disk, and both halves of the
+metadata that describes it were written only at a clean close.
+
+`Scheduler.close()` writes `requests.queue/active.json`, the list of domains
+with queued requests. queuelib's `FifoDiskQueue.close()` writes each queue's
+`info.json`, holding its head, tail and size. After a SIGKILL neither exists,
+so the resumed scheduler opened no queues at all and reported an empty
+frontier.
+
+Reporting empty is worse than it sounds, because it is not inert.
+`ScrapyPriorityQueue.init_prios()` closes any queue that reports empty, and
+queuelib's `close()` runs `_cleanup()` at size 0, which **unlinks the chunk
+files**. Resuming destroyed the frontier rather than ignoring it.
+
+Measured: shard 0 was killed holding 3,003,701 queued requests in a 2.6 GB
+`state/job-0`. The process that replaced it crawled nothing, discovered
+nothing, and exited in 1.66 seconds with `finish_reason=finished`.
+
+Two changes fix it, and neither trusts a file a kill can skip:
+
+* `crawler/scheduler.py` rebuilds `active.json` from the directories that
+  exist. `scrapy.pqueues._path_safe` appends the md5 of the slot to a
+  sanitised copy of it, so the directory name inverts: split at the last `-`,
+  and if the md5 of the left half equals the right half, the left half is the
+  slot. A name that fails that check is skipped with a warning, never
+  guessed, because a wrong slot name would give one domain two queues and two
+  independent 5 second timers.
+* `crawler/squeue.py` rebuilds each queue's metadata by scanning its chunks.
+  Every record is a 4 byte big-endian length followed by that many bytes, so
+  a scan from the last known tail recovers the head and the size exactly. A
+  trailing record shorter than its own length header is what a kill mid-write
+  leaves, and it is truncated away.
+
+A checkpoint on the same timer as the Bloom filter bounds the scan to one
+interval's worth of pops, and `close()` marks the metadata authoritative so a
+clean restart skips the scan entirely.
+
+Verified end to end: a crawl was SIGKILLed holding 4,769 domain queues, and
+the replacement process rebuilt `active.json` from disk, resumed 32,272
+requests across 2,733 queues, and crawled 3,493 pages in the next 45 seconds.
+
+### The frontier cap bounded requests; memory was bounded by queues
+
+Capping queued requests did not cap memory, because the two are different
+resources. A measured 2 hour run pinned the request count at 3,000,810 and
+dropped 801,488 over capacity, while the per-domain queue count still grew
+from 46,788 to 132,779. The exemption that lets a new domain's first URL past
+a full frontier had no limit of its own, and domain discovery never stops.
+
+Every queue is two open files, their kernel structures, and a directory on
+disk. The memory cost was measured two independent ways that agree at 9.1 KB
+per queue: a least-squares fit of RSS against queue count over the 99 samples
+after the robots cache saturated, and a microbenchmark of 5,000 file-object
+pairs.
+
+Almost all of it was waste. queuelib reads and writes through `os.read` and
+`os.write` on the raw descriptor, so the two 8 KB buffers that `open()`
+allocates per queue were never touched. Opening with `buffering=0` costs
+0.6 KB per pair instead of 9.1 KB.
+
+`PQUEUE_MAX` then bounds what remains. 40,000 per process, because it sits
+below `robots_cache_size` (a working set larger than the cache evicts entries
+before they are reused, and the run made 197,220 robots requests for 132,779
+domains), and because 40,000 domains at one request per 5 seconds can supply
+8,000 dispatches a second against a reactor ceiling near 100.
+
+The memory guard was also above the real ceiling, so it never fired. The
+kernel killed shard 0 at 3,110 MB while `MEMUSAGE_LIMIT_MB` was 3400 per
+process. The old arithmetic, `3400 x 2 = 6800 against 7,934 physical`, ignored
+about 3,000 MB of page cache and 300 to 400 MB of kernel slab for 269,087
+descriptors, and its 2,800 MB projection had been measured while cross-shard
+handoff was broken. The limit is now 2800, which the process reaches before
+the kernel does.
+
 ## Measured results
 
 | Metric | Before | After |

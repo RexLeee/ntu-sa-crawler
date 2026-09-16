@@ -73,7 +73,11 @@ SCRAPER_SLOT_MAX_ACTIVE_SIZE = _crawl["scraper_slot_max_active_size"]
 # Positive DEPTH_PRIORITY with FIFO queues yields breadth-first order, which
 # spreads load across domains.
 DEPTH_PRIORITY = _crawl["depth_priority"]
-SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+# queuelib's FifoDiskQueue writes its head/tail metadata only at close, so a
+# killed shard resumed with an empty frontier and then DELETED the chunks.
+# The subclass rebuilds the metadata by scanning, and drops the two unused
+# 8 KB buffers each queue was holding. See crawler/squeue.py.
+SCHEDULER_DISK_QUEUE = "crawler.squeue.RecoverablePickleFifoDiskQueue"
 SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
 # DownloaderAwarePriorityQueue picks the next domain by scanning every
 # per-domain queue, which a profile put at 52% of all CPU. The subclass keeps
@@ -96,15 +100,22 @@ JOBDIR = _state["jobdir"]
 DUPEFILTER_CLASS = "crawler.dupefilter.BloomDupeFilter"
 BLOOM_DUPEFILTER_CAPACITY = _mem["bloom_capacity"]
 BLOOM_DUPEFILTER_ERROR_RATE = _mem["bloom_error_rate"]
-# Without this only a clean close persists the filter, so an OOM kill or a
-# SIGKILL loses the whole run's dedupe state and the restarted shard re-fetches
-# its entire frontier.
-BLOOM_CHECKPOINT_INTERVAL = _mem["bloom_checkpoint_interval"]
+# How often the Bloom filter and the frontier metadata are saved. Without it
+# only a clean close persists either, so an OOM kill lost the whole run's
+# dedupe state AND left a frontier the scheduler could not read. Shared by
+# crawler/dupefilter.py and crawler/scheduler.py so the two cannot drift.
+CHECKPOINT_INTERVAL = _mem["checkpoint_interval"]
 
 # Nothing in Scrapy caps the frontier, so a breadth-first crawl fills it about
 # 33x faster than it drains. This is the backstop.
 SCHEDULER = "crawler.scheduler.CappedScheduler"
 FRONTIER_MAX_SIZE = _mem["frontier_max_size"]
+# Bounds per-domain QUEUES, which is a different resource from queued
+# requests: a measured run held the request count at 3.0M while the queue
+# count tripled, because a new domain's first URL is exempt from the request
+# cap. Each queue is two open files plus a directory, so this is the limit
+# that bounds RSS, descriptors and disk. See config.toml [memory].
+PQUEUE_MAX = _mem["pqueue_max"]
 
 # Hard stop. Defaults to 0, meaning no limit at all.
 MEMUSAGE_ENABLED = True

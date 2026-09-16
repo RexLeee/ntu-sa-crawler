@@ -280,6 +280,16 @@ class BroadSpider(Spider):
             yield req
 
     def _seed_requests(self):
+        """Yield the seeds this shard owns.
+
+        dont_filter stays False, which means a resumed run yields nothing here:
+        the Bloom checkpoint remembers all 1,000 seeds. That is correct
+        deduplication, and it is deliberately not worked around. The starting
+        work for a resumed shard is its disk frontier, which
+        crawler/scheduler.py reloads in open(). A measured run where that
+        reload was missing exited in 1.66 seconds having crawled nothing, and
+        the defect was the unreadable frontier, not the filtered seeds.
+        """
         if not self.seeds_path.exists():
             raise CloseSpider(f"seeds file not found: {self.seeds_path}")
 

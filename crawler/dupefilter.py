@@ -83,7 +83,7 @@ class BloomDupeFilter(BaseDupeFilter):
             capacity=settings.getint("BLOOM_DUPEFILTER_CAPACITY", 100_000_000),
             error_rate=settings.getfloat("BLOOM_DUPEFILTER_ERROR_RATE", 1e-4),
             debug=settings.getbool("DUPEFILTER_DEBUG"),
-            checkpoint_interval=settings.getfloat("BLOOM_CHECKPOINT_INTERVAL", 0.0),
+            checkpoint_interval=settings.getfloat("CHECKPOINT_INTERVAL", 0.0),
             fingerprinter=crawler.request_fingerprinter,
         )
         # The spider checks URLs against this filter before it builds a

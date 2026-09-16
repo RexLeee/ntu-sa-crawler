@@ -314,15 +314,22 @@ skip_query_keys = ["sessionid", "phpsessid", "jsessionid", "sid", "sessid", "ses
 # it would not be if any single URL had to be fetched.
 bloom_capacity = 100_000_000
 bloom_error_rate = 1e-4
-# Save the filter every this many seconds while the crawl runs.
+# Save the Bloom filter AND the frontier metadata every this many seconds.
 #
-# BloomDupeFilter.close() is the only thing that persists it, so until now a
-# SIGKILL or an OOM kill lost the entire run's dedupe state: the restarted
-# shard resumes a frontier holding millions of requests it has no memory of
-# having seen, and re-fetches them. A checkpoint bounds that loss to one
-# interval. The cost is one save of a 240 MB filter, which is a few hundred
-# milliseconds of disk write on this machine, 8 times an hour.
-bloom_checkpoint_interval = 900
+# Two things used to persist only at a clean close. The Bloom filter, so a
+# SIGKILL lost the entire run's dedupe state. And queuelib's per-queue
+# head/tail metadata, which is worse: without it the resumed scheduler saw an
+# empty frontier, and because an empty queue gets closed and a closed empty
+# queue deletes its own chunk files, resuming DESTROYED the frontier. A
+# measured run lost 2.6 GB of queued requests that way.
+#
+# The checkpoint bounds both losses to one interval. Measured costs per
+# interval: one 240 MB filter save is a few hundred milliseconds, and saving
+# 40,000 queue metadata files is about 1.5s on this disk. Both run on the
+# reactor thread and neither affects compliance, because the per-domain delay
+# is anchored to the previous response's completion and a pause can only
+# widen a gap. The scheduler records the real cost as checkpoint/frontier_ms.
+checkpoint_interval = 900
 # Nothing in Scrapy caps the queue, so this is enforced by a scheduler
 # subclass. A new domain's first URL is exempt, because domain count is what
 # bounds throughput.
@@ -348,10 +355,55 @@ bloom_checkpoint_interval = 900
 # only holds URLs this crawl will never reach: a measured hour dequeued 6.6%
 # of what it enqueued.
 #
-# Disk follows: 3M x 660 B x 2 shards is 4.0 GB, against 13.2 GB at 10M. That
-# matters too, because the measured disk burn was 4,193 MB/h with R^2 0.99 and
-# no deceleration, which exhausts the 60 GB disk at about hour 13 of 48.
+# Disk follows: 3M x 660 B x 2 shards is 4.0 GB, against 13.2 GB at 10M.
+#
+# The 2 hour run showed this cap works and is not sufficient. It pinned the
+# request count at 3,000,810 and dropped 801,488 over capacity, while the
+# queue count still grew from 46,788 to 132,779, because the new-domain
+# exemption below has no limit of its own. pqueue_max is that limit.
+#
+# Disk, measured in three separate regimes rather than as one average:
+#
+#   filling, both shards      ~5,150 MB/h   = the 2.6 GB each jobdir reaches
+#   at the cap, both shards    2,131 MB/h
+#   at the cap, one shard        190 MB/h
+#
+# So the steady state is about 190 MB/h per shard of dead bytes, which
+# queuelib only reclaims when a whole chunk drains or a queue empties, plus
+# roughly 12 KB for every new domain directory. The 4,529 MB/h headline from
+# the 2 hour run was the filling phase and the unbounded queue growth mixed
+# together, not a steady rate.
 frontier_max_size = 3_000_000
+# Ceiling on live per-domain queues, per process. This is the limit the 2 hour
+# run needed and did not have.
+#
+# Each queue is a ScrapyPriorityQueue wrapping a FifoDiskQueue: two open
+# files, their kernel structures, and a directory holding a chunk file. The
+# memory cost was measured two independent ways and they agree at 9.1 KB per
+# queue: a least-squares fit of RSS against queue count over the 99 samples
+# after the robots cache saturated, and a microbenchmark of 5,000 file-object
+# pairs. crawler/squeue.py removes 8.5 KB of that by dropping the two unused
+# buffers, so the remaining cost is about 0.6 KB of Python plus ~1.5 KB of
+# kernel slab per queue.
+#
+# 40_000 rather than a bigger number, for three reasons:
+#
+#   1. It sits below robots_cache_size (50,000). The pqueue ring visits every
+#      domain in turn, so a working set larger than the robots cache evicts
+#      entries before they are reused: the run made 197,220 robots requests
+#      for 132,779 domains, and most of the excess was re-fetching evicted
+#      hosts.
+#   2. Throughput does not need more. The reactor ceiling is ~100 dispatches
+#      per second per shard, and 40,000 domains at one request per 5s can
+#      supply 8,000/s, an 80x margin.
+#   3. Measured: 42,395 queues at RSS 2,138 MB, which is the level the
+#      recomputed memusage_limit_mb below is sized against.
+#
+# discovered/unique is unaffected: it is written in the spider's _admit()
+# before the scheduler sees the URL. A refused URL is already in the Bloom
+# filter, so it does not come back, but other URLs on that domain will be
+# admitted once a queue frees up.
+pqueue_max = 40_000
 # Hard stop below the 7.9 GB the t2d-standard-2 has. It has to stay below
 # physical RAM or it is not a guard at all: the OOM killer would SIGKILL the
 # process before Scrapy's MemoryUsage extension noticed, losing the log flush
@@ -370,26 +422,46 @@ frontier_max_size = 3_000_000
 # added 5,404 hosts for 7 MB. Extrapolating the remaining 4,214 hosts to the
 # 50,000 ceiling puts a settled process near 2,800 MB.
 #
-# 3400, not 3000. Two things forced the change.
+# MemoryUsage reads resource.getrusage().ru_maxrss, which is the PEAK RSS ever
+# reached, not the current one. A single transient spike therefore trips the
+# limit permanently: no later collection can bring the reading back down.
+# Margin has to cover spikes, not just the settled level.
 #
-# First, MemoryUsage reads resource.getrusage().ru_maxrss, which is the PEAK
-# RSS ever reached, not the current one. A single transient spike therefore
-# trips the limit permanently: no later collection can bring the reading back
-# down. Margin has to cover spikes, not just the settled level.
+# 2800, not 3400. The 3400 arithmetic was wrong and the kernel proved it: the
+# OOM killer SIGKILLed shard 0 at 3,110 MB anon-rss while this guard, set at
+# 3400 per process, had never fired. The guard was above the real ceiling, so
+# it could not do its job.
 #
-# Second, the measured peaks were 2,724 and 2,809 MB against a 3000 limit, so
-# shard 1 had 191 MB left, and memusage/warning_reached was already 1 on both
-# shards inside 20 minutes.
+#   [Wed Sep 16 16:14:01 2026] Out of memory: Killed process 1761 (scrapy)
+#   total-vm:4873408kB, anon-rss:3110200kB
 #
-# 3400 x 2 = 6800 MB against 7,934 MB physical, leaving ~1.1 GB for the kernel
-# and the page cache, and ~600 MB per process above the projection. Staying
-# under physical RAM is what matters: hitting THIS limit closes the spider
-# cleanly, via the same close path as the timed shutdown, so the logs, the
-# Bloom filter and the stats all survive. Hitting physical RAM instead means
-# the OOM killer SIGKILLs the process and all of that is lost. The cost of a
-# clean stop is one shard's share of the remaining hours, which is expensive
-# but not corrupting.
-memusage_limit_mb = 3400
+# What the old comment missed, in the order it matters:
+#
+#   1. Page cache. It said 2 x 3400 = 6800 leaves 1.1 GB. During the run
+#      `free -m` showed about 3,000 MB of buff/cache, and the kernel does not
+#      drop all of it to satisfy an anonymous allocation.
+#   2. Kernel slab. 269,087 open descriptors at peak, each with a struct
+#      file, dentry and inode, is 300-400 MB that never appears in RSS.
+#   3. The projection itself was measured while cross-shard handoff was
+#      broken. With it working there are 43% more domains, and the real
+#      figure was 3,000-3,180 MB rather than the 2,800 projected.
+#
+# The budget now: 2 x 2800 = 5600, plus ~300 MB kernel base, plus ~120 MB of
+# slab for the 80,000 descriptors pqueue_max allows, leaves about 1.9 GB for
+# page cache against the 7,934 MB this machine has.
+#
+# The expected settled level is below it rather than at it. 42,395 queues
+# measured at 2,138 MB, minus about 350 MB of file buffers that
+# crawler/squeue.py no longer allocates, is roughly 1,800-1,900 MB. So the
+# guard sits ~900 MB above the steady state and ~300 MB below the level the
+# kernel actually killed at.
+#
+# Hitting THIS limit closes the spider cleanly, through the same path as the
+# timed shutdown, so the logs, the Bloom filter and the stats survive and
+# ops/run_hour.sh restarts the shard on its own frontier. Hitting physical RAM
+# instead means a SIGKILL. That is the whole reason the number has to be low
+# enough to be reached first.
+memusage_limit_mb = 2800
 # Python's cyclic collector walks every tracked container object on a gen-2
 # pass. This process holds a lot of them: objects-0.log recorded 848,879
 # protego _Rule plus 848,879 _URLPattern at the end of a 20 minute run, 1.7M
@@ -422,15 +494,16 @@ gc_threshold0 = 5_000
 # gen-2 passes stop traversing the interpreter, Scrapy and the imported
 # libraries. Only the objects the crawl itself creates afterwards are walked.
 gc_freeze_at_start = true
-# 3000, not 2500. The projected settled level is ~2,800 MB, so a 2500 warning
-# fires on every healthy run: both shards had memusage/warning_reached = 1
-# inside 20 minutes. A warning that always fires carries no information.
+# 2400, tracking the limit above. The expected settled level is 1,800-1,900 MB
+# once the frontier queues stop carrying unused buffers, so this sits about
+# 500 MB above a healthy run and 400 MB below the hard stop.
 #
-# 3000 sits above the projection and 400 MB below the limit, so it fires only
-# when a run is genuinely heading for the hard stop. It is a real signal: the
-# memusage_warning_reached stat is the only advance notice that a shard is
-# about to close itself.
-memusage_warning_mb = 3000
+# A warning that fires on every healthy run carries no information, which is
+# what happened at 2500 against a 2,800 MB working set: both shards set
+# memusage/warning_reached inside 20 minutes. The margin matters because
+# memusage_warning_reached is the only advance notice that a shard is heading
+# for a self-close.
+memusage_warning_mb = 2400
 # Scrapy keeps every robots.txt parser it ever builds, keyed by hostname, and
 # never evicts. Measured: 0.9 KB for a one-rule file, 7.1 KB for a typical
 # one, 369 KB for a 500-rule one. That dict was the main driver of the

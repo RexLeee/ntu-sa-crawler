@@ -324,16 +324,28 @@ memusage_limit_mb = 3000
 # objects in two types alone. Every gen-2 pass is a stop-the-world pause on
 # the reactor thread, which is the thread the per-domain timers live on.
 #
-# 50_000 rather than the 700 default: gen-0 fires 71x less often, and a broad
-# crawl allocates enormous numbers of short-lived parse objects that are all
-# collected by reference counting anyway. Reported to cut GC from ~3% of
-# runtime to ~0.5% in a comparable workload.
+# 5_000, not 50_000, and the difference was measured rather than reasoned.
+#
+# 50_000 raised throughput 25% and cost 640 MB per shard, which is the wrong
+# trade on a 7.9 GB machine with a 3000 MB per-process limit. A 20 minute run
+# ended at 2,686 and 2,778 MB against that limit, leaving 222 MB. The same run
+# at the default threshold ended at 1,980 and 2,204 MB.
+#
+# The object dumps say where it went. Against the earlier run at the same
+# elapsed time: frame 39,117 -> 219,579 and traceback 21,837 -> 121,014, both
+# 5.6x. Those are reference cycles that only the collector frees, and a broad
+# crawl manufactures them constantly because every failed request builds a
+# traceback. Raising threshold0 by 71x let 71x as many accumulate.
+#
+# 5_000 is 7x the default, so gen-0 still runs 7x less often, but the cycle
+# backlog stays bounded. Verify on the next run that per-shard RSS settles
+# below 2,500 MB and that lag_p50 stays under the 2,269 ms the default
+# produced.
 #
 # Compliance does not depend on this. The completion-anchored delay holds
-# through any pause; this is throughput and tail latency only. runstats
-# records gc_max_ms and gc_total_ms so the effect is measured rather than
-# assumed.
-gc_threshold0 = 50_000
+# through any pause; this is throughput and memory only. runstats records
+# gc_max_ms and gc_total_ms so the effect stays measured.
+gc_threshold0 = 5_000
 # Move everything alive at spider_opened into the permanent generation, so
 # gen-2 passes stop traversing the interpreter, Scrapy and the imported
 # libraries. Only the objects the crawl itself creates afterwards are walked.

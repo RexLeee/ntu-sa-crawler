@@ -219,11 +219,41 @@ uv run python ops/report_timeline.py data/run-<stamp>
 ```bash
 # stats.json 裡的 finish_reason 才是乾淨關閉的證據。
 # "Dumping Scrapy stats" 那行是 INFO，log_level 是 WARNING，永遠不會出現。
-grep -h finish_reason data/run-*/stats-*.json            # 每個 shard 一個
+grep -h finish_reason data/run-*/stats-*.json            # 每個 shard 都要 run_duration
 ls state/job-*/requests.bloom                            # 每個 shard 一個
-cat data/run-*/supervisor.log                            # 應該是空的
+cat data/run-*/supervisor.log                            # crash 必須 0；self-close 可接受
 tail -3 data/run-*/resources.tsv                         # 看 RSS 與 disk_free_mb
 ```
+
+`supervisor.log` 的判準改了。`finish_reason=memusage_exceeded` 是乾淨關閉，
+supervisor 會重啟那個 shard，log 裡寫 `closed itself`。這是健康事件：
+bloom 已存檔、frontier 在磁碟上，新 process 的 robots cache 歸零。
+`died rc=` 才是缺陷，必須是 0。`run_hour.sh` 的 close check 會分開報。
+
+跨 shard 交接必須真的在運作，這是一小時 run 唯一漏掉的檢查：
+
+```bash
+grep -o '"handoff/[a-z_]*": [0-9]*' data/run-*/stats-*.json
+grep -c AsyncioLoopingCall data/run-*/scrapy-*.log       # 必須是 0
+grep -o '"spider_exceptions[^,]*' data/run-*/stats-*.json # 不該出現 ValueError
+du -sh state/handoff/to-*                                 # 不該是整場 run 的量
+```
+
+- 一邊的 `handoff/sent` 要約等於另一邊的 `handoff/received`。
+  一小時 run 是 1,791,515 對 181,164，因為兩個 loop 在前九分鐘就死了。
+- `AsyncioLoopingCall` 的錯誤訊息出現一次就代表交接已經停了，整場都不會恢復。
+- `handoff/bad_url` 可以大於 0，那是 backstop 在工作；但 loop 必須活到結束。
+
+frontier 與檔案描述符要一起看，它們是同一條曲線：
+
+```bash
+for f in data/runstats-*.tsv; do tail -1 $f | cut -f14,15; done  # frontier, pqueues
+tail -1 data/run-*/resources.tsv | cut -f5                       # fds
+```
+
+frontier 到 `frontier_max_size`（3M）之後，`pqueues` 與 `fds` 都必須持平。
+繼續線性上升就是上限沒生效。`scheduler/dropped/over_capacity` 大於 0
+才證明上限真的在作用。
 
 還要看兩個東西，兩個都必須是空的：
 

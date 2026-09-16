@@ -90,22 +90,43 @@ JOBDIR.** Counting the frontier once was an error that hid 13 GB.
 
 | | |
 |---|---|
-| Frontier ceiling, 2 x `state/job-N` | 13.2 GB |
+| Frontier ceiling, 2 x `state/job-N` | 4.0 GB |
 | Logs, gzipped, at 53 pages/s | 7.3 GB |
 | `dispatched.log.gz`, all requests | 1.0 GB |
+| Handoff inbox, 2 senders x 2 segments | 0.3 GB |
+| Bloom filters, 2 x 240 MB | 0.5 GB |
 | `collect()` copy into `data/run-<stamp>/` | 8.3 GB |
 | OS, uv, venv | 8 GB |
-| **Total** | **37.8 GB** |
+| **Total** | **29.4 GB** |
 
 The log figures come from a real run: `discovered.log.gz` held 4,075,529 lines
 in 43,961,228 bytes, so a discovered URL costs 10.79 bytes compressed and a
-crawled page costs 31.87. The frontier ceiling is `frontier_max_size` (10M per
-process, halved from 20M for exactly this reason) times the 660 bytes per
-request a measured run showed, times two shards.
+crawled page costs 31.87. The frontier ceiling is `frontier_max_size` (3M per
+process) times the 660 bytes per request a measured run showed, times two
+shards.
+
+The earlier version of this table read 37.8 GB with a 13.2 GB frontier, and it
+was measured against instead of trusted. A one hour run consumed disk at
+4,193 MB/h with a linear fit of R² 0.99 and no deceleration, which exhausts
+the 60 GB disk at about hour 13 of 48. Almost all of it was the frontier:
+`scheduler/enqueued` was 3.29M against `scheduler/dequeued` 216k on one shard,
+a 6.6% drain, while the compressed logs wrote only 90 MB in that hour. That
+measurement is why `frontier_max_size` is now 3M, and the line item fell with
+it.
+
+The handoff line is new. The inbox was one append-only file per sender pair
+that nothing ever truncated, writing 143 MB/hour uncompressed, so it was
+heading for 6.9 GB with no entry in this table. It is now rotated into 64 MB
+segments and a finished segment is deleted.
 
 `ops/run_hour.sh` samples free disk every 30s into `resources.tsv` and stops
-the run below `MIN_DISK_FREE_MB` (3000). A full disk fails the gzip writers and
+the run below `MIN_DISK_FREE_MB` (8000). A full disk fails the gzip writers and
 the JOBDIR write path at the same moment, which kills both shards at once.
+
+8000 rather than 3000 because the low-disk path's first action is `collect()`,
+which copies every log into the run directory **on the same filesystem**. With
+a 3000 MB reserve and several GB of logs, the handler would fill the disk it
+exists to protect.
 
 The default 10 GB boot disk would fill during the run. Disk is $0.0027 per GB
 over 48 hours, so the headroom is nearly free.

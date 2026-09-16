@@ -208,6 +208,62 @@ requests on one slot with a 2 second delay must dispatch 2 seconds apart, the
 guard must stay silent, and the dispatch log must hold one line per request
 all grouped under one key.
 
+### The guard measures monotonic time, the log records wall clock
+
+These are two different clocks on purpose. The limiter in
+`crawler/downloader.py` spaces requests using `monotonic()`, so a guard that
+compared wall-clock stamps would disagree with the thing it is checking
+whenever the two clocks diverge.
+
+Over 48 hours `chronyd` will step the wall clock at least once, and both
+directions are bad:
+
+- A **backward** step invents a gap shorter than the one that happened. The
+  guard would drop the page, increment `dispatch/guard_refused` and write to
+  `violation-trace`. Those three are exactly what the acceptance list reads as
+  proof of a violation, so a clock adjustment would fail the run's own
+  evidence with nothing wrong.
+- A **forward** step would hide a real short gap.
+
+`request.meta['dispatch_time']` and `dispatched*.log.gz` still carry wall
+clock, because `ops/verify_politeness.py` reads them offline in a different
+process. `tests/test_dispatch.py clock` asserts both directions.
+
+### A restart is a hole in the guarantee, and the fix is a 60 second pause
+
+The limiter's state is process memory: `slot.lastseen`,
+`DomainSlotDownloader._last_complete` and `dispatch._last_out` all die with
+the process. A restarted shard resumes its frontier from disk with no memory
+of when it last touched any domain, so `_process_queue` reads
+`lastseen = 0` and dispatches immediately, and the guard's dictionary is empty
+so it does not object.
+
+`ops/run_hour.sh` therefore waits `restart_pause` before relaunching a shard.
+That is 60 seconds, read from `config.toml`, and the number is not arbitrary:
+it equals `max_crawl_delay`, which is the largest gap any single domain can
+require. Waiting the largest possible delay satisfies every domain at once,
+without persisting any per-domain state.
+
+The previous value was a bare `sleep 5` against a 5.0 second floor. It had no
+margin, and it was simply too short for any domain whose `robots.txt` asks for
+more than five seconds.
+
+### `rc=0` does not mean the run finished
+
+Scrapy's `MemoryUsage` extension closes the spider cleanly when
+`MEMUSAGE_LIMIT_MB` is reached. That is a normal shutdown: it writes the stats
+dump, persists the Bloom filter, and exits 0 with
+`finish_reason=memusage_exceeded`.
+
+The supervisor used to treat any `rc=0` as completion, so the first shard to
+fill up would end the entire 48 hour run at whatever hour that happened. It
+now reads `finish_reason` and only accepts `run_duration`. A self-close is in
+fact the ideal moment to restart, because the shard has just saved everything
+worth keeping and the new process starts with an empty robots cache.
+
+The close check reports crash restarts and self-close restarts separately.
+Only a crash is a defect.
+
 ## Measured results
 
 | Metric | Before | After |
@@ -405,6 +461,43 @@ GB, which matches the 5,312 MB the long run reached.
 It is now a bounded `LocalCache`. Eviction is safe because a miss re-fetches
 `robots.txt` and waits for it; the check is never skipped. `tests/test_robots_cache.py`
 asserts exactly that, along with the eviction not breaking in-flight fetches.
+
+### Then the frontier cap became the memory ceiling, through file descriptors
+
+The robots cache saturates: a one hour run reached the 50,000 limit at about
+28 minutes and RSS stopped climbing. What kept climbing was the frontier, and
+its cost is not the disk it is stored on.
+
+Each domain holding queued requests is one `ScrapyPriorityQueue` wrapping a
+queuelib `FifoDiskQueue`, and a `FifoDiskQueue` keeps **two** descriptors open,
+head and tail. So per-domain queues, descriptors and Python objects all track
+the frontier's size. Measured on one shard of a one hour run:
+
+| frontier | per-domain queues | fds | RSS |
+|---|---|---|---|
+| 1.07M | 27,020 | ~62,000 | 1,915 MB |
+| 1.83M | 35,755 | ~82,000 | 2,116 MB |
+| 2.52M | 57,018 | ~117,000 | 2,208 MB |
+| 3.07M | ~60,000 | 150,778 | 2,317 MB |
+
+The queue count rises linearly with the frontier, R² 0.95, with no plateau in
+the window. A 10M cap therefore implies roughly 190,000 queues and 380,000
+descriptors per shard, against a `memusage_limit_mb` of 3,400 that reads
+**peak** RSS and so never recovers from a spike. The frontier depth was what
+was going to trip that limit at some unknown hour of 48.
+
+Cutting the cap to 3M costs nothing either reported metric measures:
+
+- `discovered/unique` is written in the spider's `_admit()`, before the
+  scheduler ever sees the URL. A dropped request does not reduce it.
+- `crawled` is bounded by active domains divided by the delay, and a new
+  domain's first URL is exempt from the cap. A measured hour dequeued 6.6% of
+  what it enqueued, so the URLs beyond the cap were never going to be fetched
+  in the time available.
+
+Disk followed. The same hour consumed 4,193 MB/h with a linear fit of R² 0.99
+and no deceleration, which exhausts the 60 GB boot disk at about hour 13 of
+48. The compressed logs wrote 90 MB of that; the rest was the frontier.
 
 ### The reactor thread is the fourth ceiling, but not for the reason below
 
@@ -713,6 +806,69 @@ same Bloom filter and the same per-domain limits. They are deliberately not
 counted into `discovered_raw` again: the shard that found the link already
 counted it, and recounting would inflate the Tier 1 metric once per process
 boundary crossed.
+
+### One malformed URL stopped all cross-shard delivery for 51 minutes
+
+The design above was correct and the implementation was silently not running.
+A one hour run recorded this:
+
+| | shard 0 | shard 1 |
+|---|---|---|
+| `handoff/sent` | 1,092,699 | 698,816 |
+| `handoff/received` | 107,500 | 73,664 |
+
+Sent and received have to be equal across a pair of shards. They were not,
+and the logs said why:
+
+```
+[scrapy.utils.asyncio] ERROR: Error calling the AsyncioLoopingCall function
+  File "crawler/spiders/broad.py", line 198, in _drain_handoff
+    request = self._admit(url, key)
+  File "w3lib/url.py", line 146, in safe_url_string
+ValueError: Port could not be cast to integer value as 'void(0)'
+```
+
+Shard 1 died at 5 minutes, shard 0 at 9. `AsyncioLoopingCall` does not
+reschedule after its function raises, and the `try/except` in `_drain_handoff`
+covered only `poll()`, not the admission below it. So a single
+`http://host:void(0)/` ended delivery for the rest of the run, and each shard
+fell back to crawling what its own seeds could reach. Every throughput,
+domain-count and memory figure from that run was measured in that state.
+
+The root cause is not in the handoff at all. `urlsplit()` accepts any text
+after the colon in `host:port` and only parses it when `.port` is read;
+`canonicalize_url()` never reads it. So the URL passed every check in
+`UrlFilter.normalize()` and raised inside `Request.__init__` instead.
+Reading the property in `normalize()` is the fix, and `tests/test_filters.py`
+asserts the general invariant rather than the one case: nothing `normalize()`
+returns may raise in `Request()`. Testing every odd URL shape I could think of
+found no second instance.
+
+The same exception was also aborting `parse()` part-way through its generator
+and losing the rest of that page's links, 14 times in the measured hour. That
+is `spider_exceptions/ValueError` in the stats, and it came from the same
+malformed URLs.
+
+`_drain_handoff` still wraps each URL individually and counts
+`handoff/bad_url`, because a dead delivery loop costs vastly more than a
+dropped URL. Two defences for one bug is the right ratio when the failure is
+silent: nothing in the run's own acceptance list had caught it.
+
+### The inbox needed three more properties to last 48 hours
+
+Writing an append-only file per sender pair is fine for an hour and not for
+two days:
+
+- **It never shrank.** 143 MB/hour of uncompressed URLs, about 6.9 GB over 48
+  hours, and it appeared in no disk budget. Segments are now 64 MB, and a
+  segment read to the end whose sender has moved on is deleted.
+- **`poll()` read to the end of the file**, which materialises everything
+  written since the last call. It runs on the reactor thread, so its cost has
+  to be bounded by a number we choose rather than by how much the other shards
+  happened to write. It now reads 4 MB per segment per call.
+- **Offsets lived only in memory.** A restarted shard reread its inbox from
+  zero and re-injected every URL ever handed to it. They are now written next
+  to the inbox after every poll, through a temp file and `os.replace`.
 
 ### The shard count is set by memory, not by cores
 

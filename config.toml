@@ -227,6 +227,32 @@ handoff_poll_interval = 5.0
 # Ceiling on URLs admitted per poll. This runs on the reactor thread, so an
 # unbounded inbox would block every download while it drained.
 handoff_batch_max = 5000
+# Rotate a sender's outbox at this size. The recipient deletes a segment once
+# it has read it to the end and the sender has moved on, so the inbox holds
+# about one segment per sender instead of the whole run.
+#
+# A measured hour wrote 1.79M uncompressed URLs across both shards, about
+# 143 MB, in a single file that nothing ever truncated. Over 48 hours that is
+# roughly 6.9 GB of a 60 GB disk, and it appeared in no budget.
+handoff_segment_bytes = 67_108_864   # 64 MB
+# Ceiling on bytes read per segment per poll. poll() used to read to the end
+# of the file, which materialises everything written since the last call. The
+# poll runs on the reactor thread, so its cost has to be bounded by a number
+# we choose rather than by how much the other shards happened to write.
+handoff_read_bytes = 4_194_304       # 4 MB
+# How long to wait before restarting a shard. NOT a backoff: it is the
+# politeness interval across a process boundary.
+#
+# The limiter's state (slot.lastseen, DomainSlotDownloader._last_complete) and
+# the guard's state (dispatch._last_out) are both process memory. A restarted
+# shard resumes its frontier from disk with no memory of when it last touched
+# any domain, so its first request to each one goes out immediately. Waiting
+# here is what makes that safe, and the wait has to cover the largest delay
+# any domain can have, not the 5.0s floor: max_crawl_delay is 60.0, so a
+# domain whose robots.txt asks for 60s needs 60s. The previous value was a
+# bare 5, which had zero margin against required_min_gap and was short for
+# every Crawl-delay domain.
+restart_pause = 60.0
 
 [limits]
 # A single domain can yield at most 34560 pages in 48h anyway (1 per 5s).
@@ -268,32 +294,64 @@ skip_query_keys = ["sessionid", "phpsessid", "jsessionid", "sid", "sessid", "ses
 # the machine holds that many copies of each. They are sized for the single
 # process the crawl currently runs as; divide them before sharding.
 
-# Sized for the whole 48 hours, not the current count. Past capacity the
-# false positive rate climbs sharply. 50M costs about 171 MB.
-bloom_capacity = 50_000_000
-# One wrongly dropped URL per million. At 50M that is ~50 URLs never fetched,
-# which is acceptable when the metric is aggregate volume.
-bloom_error_rate = 1e-6
+# Sized for the whole 48 hours, not the current count. Past capacity the false
+# positive rate climbs sharply, and the climb is the reason for both numbers
+# below.
+#
+# 100M, not 50M. A measured hour reached 3.27M unique URLs per shard while
+# cross-shard handoff was broken; with it working the rate is higher, and even
+# at a decaying 2-3M/h the 48 hour total per shard is 100-150M. At 50M the
+# filter would be running at 2-3x capacity for most of the run.
+#
+# The error rate is what pays for the capacity. rbloom sizes m and k from
+# (capacity, error_rate), and the realised rate at n items is
+# (1 - e^(-kn/m))^k. At 1e-6 the optimal k is 20, which degrades badly past
+# capacity: 0.3% at 2x, 6.9% at 3x. At 1e-4 k is 13, giving 0.29% at 1.5x and
+# 2.1% at 2x, and costs 240 MB against 171 MB.
+#
+# 1e-4 at 100M is 10,000 URLs dropped that were never crawled. The trade is
+# one-directional and acceptable here because the metric is aggregate volume;
+# it would not be if any single URL had to be fetched.
+bloom_capacity = 100_000_000
+bloom_error_rate = 1e-4
+# Save the filter every this many seconds while the crawl runs.
+#
+# BloomDupeFilter.close() is the only thing that persists it, so until now a
+# SIGKILL or an OOM kill lost the entire run's dedupe state: the restarted
+# shard resumes a frontier holding millions of requests it has no memory of
+# having seen, and re-fetches them. A checkpoint bounds that loss to one
+# interval. The cost is one save of a 240 MB filter, which is a few hundred
+# milliseconds of disk write on this machine, 8 times an hour.
+bloom_checkpoint_interval = 900
 # Nothing in Scrapy caps the queue, so this is enforced by a scheduler
-# subclass. Dropped URLs are not marked as seen and can return later.
+# subclass. A new domain's first URL is exempt, because domain count is what
+# bounds throughput.
 #
-# Raised from 2M. The frontier lives on disk under JOBDIR, so the cost is not
-# memory: a measured run held 930k requests in 610 MB, about 660 bytes each.
-# At 2M the cap was reached in roughly an hour, and after that every new URL
-# was dropped, including the first URL of an unseen domain. That is the one
-# thing we cannot afford to drop, so CappedScheduler now exempts it as well.
+# 3M, not 10M, and the binding cost is not disk. Each domain holding queued
+# requests is one ScrapyPriorityQueue wrapping a queuelib FifoDiskQueue, which
+# keeps TWO file descriptors open (head and tail) plus its Python objects. A
+# measured hour, per shard:
 #
-# 10M, not 20M. PER PROCESS, and that is what forced the change: at shards = 2
-# the machine holds two frontiers, so 20M each is 20M x 660 B x 2 = 26.4 GB.
-# The disk budget in ops/GCP_SETUP.md counted it once and arrived at 35 GB of
-# the 60 GB disk; counting it twice puts the total at 47 GB with no margin for
-# the logs the run is actually being kept for. At 10M the ceiling is 13.2 GB
-# total and the budget lands near 34 GB.
+#   frontier 1.07M -> 27,020 queues,  ~62,000 fds, RSS 1,915 MB
+#   frontier 1.83M -> 35,755 queues,  ~82,000 fds, RSS 2,116 MB
+#   frontier 2.52M -> 57,018 queues, ~117,000 fds, RSS 2,208 MB
+#   frontier 3.07M -> ~60,000 queues, 150,778 fds, RSS 2,317 MB
 #
-# Reaching the cap is not the failure mode it was. The frontier fills about
-# 33x faster than it drains, so the cap is reached either way; what matters is
-# that a new domain's first URL is exempt, which it is.
-frontier_max_size = 10_000_000
+# The queue count rises linearly with the frontier (R^2 0.95) and shows no
+# plateau. At 10M that is roughly 190,000 queues and 380,000 descriptors per
+# shard, against a memusage_limit_mb of 3400 that reads PEAK RSS and so never
+# recovers. The frontier depth is what was going to trip that limit.
+#
+# Depth buys nothing the report measures. discovered/unique is written in the
+# spider's _admit() before the scheduler ever sees the URL, and crawled is
+# bounded by domains / 5s, which the exemption protects. A deeper frontier
+# only holds URLs this crawl will never reach: a measured hour dequeued 6.6%
+# of what it enqueued.
+#
+# Disk follows: 3M x 660 B x 2 shards is 4.0 GB, against 13.2 GB at 10M. That
+# matters too, because the measured disk burn was 4,193 MB/h with R^2 0.99 and
+# no deceleration, which exhausts the 60 GB disk at about hour 13 of 48.
+frontier_max_size = 3_000_000
 # Hard stop below the 7.9 GB the t2d-standard-2 has. It has to stay below
 # physical RAM or it is not a guard at all: the OOM killer would SIGKILL the
 # process before Scrapy's MemoryUsage extension noticed, losing the log flush

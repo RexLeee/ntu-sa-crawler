@@ -74,6 +74,11 @@ class BroadSpider(Spider):
         # else is a defect, so they are counted rather than ignored.
         self.missing_stamp = 0
         self.handoff_foreign = 0
+        # URLs from the inbox that could not be turned into a Request. Expected
+        # to be 0 now that crawler/filters.py rejects a malformed port, but
+        # counted rather than assumed: the loop that reads the inbox must
+        # survive whatever arrives in it.
+        self.handoff_bad = 0
 
         # Cross-shard URLs are handed to their owner rather than dropped. A
         # broad crawl discovers nearly every new domain through a cross-domain
@@ -81,7 +86,13 @@ class BroadSpider(Spider):
         # discarding them would leave N processes crawling little more than
         # one. See crawler/handoff.py.
         sharding = self.cfg["sharding"]
-        self.handoff = Handoff(self.shard, self.shards, state_dir() / "handoff")
+        self.handoff = Handoff(
+            self.shard,
+            self.shards,
+            state_dir() / "handoff",
+            segment_bytes=int(sharding["handoff_segment_bytes"]),
+            read_bytes=int(sharding["handoff_read_bytes"]),
+        )
         self._handoff_interval = float(sharding["handoff_poll_interval"])
         self._handoff_batch = int(sharding["handoff_batch_max"])
         self._handoff_loop = None
@@ -180,24 +191,44 @@ class BroadSpider(Spider):
             return
 
         for url in urls:
-            key = slot_key(url)
-            # Verify ownership rather than trust the sender. Two processes
-            # crawling one domain would each run their own 5s timer with no
-            # shared state able to notice, which is the one failure mode
-            # sharding must not have. A stale inbox is enough to cause it: the
-            # files are written under the modulus of whichever run created
-            # them, so restarting with a different shard count redirects every
-            # URL already sitting there.
-            if self.shards > 1 and shard_of(key, self.shards) != self.shard:
-                self.handoff_foreign += 1
-                continue
-            if self.crawled_per_domain.get(key, 0) >= self.max_crawled_per_domain:
-                continue
-            if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
-                continue
-            request = self._admit(url, key)
-            if request is not None:
-                self.crawler.engine.crawl(request)
+            try:
+                self._inject_handoff(url)
+            except Exception as exc:
+                # One bad URL used to stop the whole loop. AsyncioLoopingCall
+                # does not reschedule after its function raises, so a single
+                # http://host:void(0)/ ended cross-shard delivery for the rest
+                # of the run: a measured hour sent 1.79M URLs and received
+                # 181k, because both loops died in the first nine minutes.
+                # crawler/filters.py now rejects that shape at the source;
+                # this is the backstop that keeps the loop alive regardless.
+                self.handoff_bad += 1
+                if self.handoff_bad == 1:
+                    logger.warning(
+                        "handoff url rejected: %s (%s); further ones counted "
+                        "in stats as handoff/bad_url",
+                        url,
+                        exc,
+                    )
+
+    def _inject_handoff(self, url: str) -> None:
+        """Admit one URL from the inbox. Raises on a malformed URL."""
+        key = slot_key(url)
+        # Verify ownership rather than trust the sender. Two processes crawling
+        # one domain would each run their own 5s timer with no shared state
+        # able to notice, which is the one failure mode sharding must not have.
+        # A stale inbox is enough to cause it: the files are written under the
+        # modulus of whichever run created them, so restarting with a
+        # different shard count redirects every URL already sitting there.
+        if self.shards > 1 and shard_of(key, self.shards) != self.shard:
+            self.handoff_foreign += 1
+            return
+        if self.crawled_per_domain.get(key, 0) >= self.max_crawled_per_domain:
+            return
+        if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
+            return
+        request = self._admit(url, key)
+        if request is not None:
+            self.crawler.engine.crawl(request)
 
     def _bind_dispatch_stats(self, spider) -> None:
         """Give the politeness guard somewhere to report refusals.
@@ -226,6 +257,7 @@ class BroadSpider(Spider):
         stats.set_value("handoff/sent", self.handoff.sent)
         stats.set_value("handoff/received", self.handoff.received)
         stats.set_value("handoff/foreign_dropped", self.handoff_foreign)
+        stats.set_value("handoff/bad_url", self.handoff_bad)
         stats.set_value("dispatch/missing_stamp", self.missing_stamp)
 
     def _release_queued(self, key: str) -> None:

@@ -50,6 +50,17 @@ class UrlFilter:
         if parts.scheme not in _ALLOWED_SCHEMES or not parts.hostname:
             return None
 
+        # urlsplit accepts any garbage after the colon and only parses it when
+        # .port is read. canonicalize_url never reads it either, so a URL like
+        # http://host:void(0)/ survived normalization and raised ValueError
+        # from safe_url_string inside Request.__init__ instead. That killed the
+        # handoff looping call five minutes into a measured run, and cost the
+        # remaining links of every page it hit in parse().
+        try:
+            _ = parts.port  # the property is what validates; the value is unused
+        except ValueError:
+            return None
+
         # Drop the fragment; it never changes what the server returns.
         absolute = absolute.split("#", 1)[0]
 

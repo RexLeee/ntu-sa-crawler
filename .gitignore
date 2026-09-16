@@ -12,12 +12,19 @@ __pycache__/
 # Crawl output: regenerated on every run, and large
 data/*.log.gz
 data/*.jsonl
-data/runstats.tsv
+data/runstats*.tsv
+data/objects*.log
+# The stats snapshot runstats writes every 30s, so a run killed some other way
+# still has a full breakdown. Regenerated on every run.
+data/stats*.json
 *.log
 
 # Per-run directories created by ops/run_hour.sh. The evidence a run produced
 # is reported from these, not read out of git.
 data/run-*/
+# Logs from a previous run that run_hour.sh moved aside rather than deleted,
+# because they had no archived copy yet.
+data/orphan-*/
 data/profile*.svg
 
 # Scrapy resume state (JOBDIR)

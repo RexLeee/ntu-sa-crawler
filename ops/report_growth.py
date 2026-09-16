@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from crawler.config import load_config  # noqa: E402
 from crawler.slot import slot_key  # noqa: E402
 
 HOURS_48 = 48 * 3600
@@ -199,13 +200,19 @@ def main() -> int:
     # Every shard writes its own log, and each domain belongs to one shard.
     crawled = sorted(rundir.glob("crawled*.log.gz"))
     if not crawled:
-        crawled = sorted(Path("data").glob("crawled*.log.gz"))
+        # Absolute, not Path("data"): a relative fallback silently finds
+        # nothing unless this is run from the project root.
+        root = Path(__file__).resolve().parent.parent
+        crawled = sorted((root / "data").glob("crawled*.log.gz"))
     if crawled:
         dts, dvs = _domain_curve(crawled)
         if dts:
             _describe("distinct domains", dts, dvs, "domains")
             # The politeness limit turns the domain count into a hard rate cap.
-            print(f"  implied ceiling : {dvs[-1] / 5.0:,.1f} pages/s at 5s delay")
+            # Read the gap from config rather than hardcoding it, so tuning the
+            # limit cannot leave this reporting against the old number.
+            gap = load_config()["politeness"]["required_min_gap"]
+            print(f"  implied ceiling : {dvs[-1] / gap:,.1f} pages/s at {gap}s delay")
 
     print("\nRead the last-third rate first, not the fit. Linear growth that")
     print("does not decelerate means the design cannot last 48 hours; a rate")

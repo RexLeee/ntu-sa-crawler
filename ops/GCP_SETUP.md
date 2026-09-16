@@ -5,35 +5,38 @@ The measured reason to move is narrower than that, though: the crawl on leepc
 used 13.3 Mbps of an 18.6 Mbps Wi-Fi link, 72% of it, and main-thread CPU fell
 from 99% to 48-58% as a result. The link was the ceiling, not the machine.
 
-**Whether this is worth doing at all is an open question until the ten minute
-test answers it.** Datacenter IP ranges are on many blocklists, and the crawl's
-response rate on a residential link is already only 48%. See "The ten minute
-test" below, which exists to settle that before any 48 hour commitment.
+The ten minute test settled the open question this document used to lead with.
+Datacenter IP ranges are on many blocklists and the residential response rate
+was only 48%, so migrating might have made things worse. Measured on t2d it
+did not: **79.6% response rate at two shards**, against the 30% floor set as
+the go/no-go criterion. The migration is decided.
 
-## Machine type: e2-medium
+## Machine type: t2d-standard-2
 
 | | |
 |---|---|
-| Machine type | `e2-medium` |
-| vCPU | 2 shared, each guaranteed 50% CPU time |
-| RAM | 4 GB |
+| Machine type | `t2d-standard-2` |
+| vCPU | 2 dedicated |
+| RAM | 7.9 GB usable |
 | Zone | `us-central1-a` |
 | Image | `ubuntu-2404-lts-amd64` |
 | Boot disk | 60 GB `pd-balanced` |
 | Provisioning | standard, **not Spot** |
 
-The two shared vCPUs each sustain 50% of CPU time, so the guaranteed floor is
-one full core. The crawl is a single-threaded reactor that measured 99% of one
-thread, so the guarantee matches the need exactly.
+**Not `e2-medium`, which this document specified until the measurements came
+in.** Two reasons, and the second is disqualifying.
 
-Larger machines buy nothing. The crawl is network-bound: four sharded
-processes measured 52.29 pages/s against 54.54 for a single process, with
-identical TCP connection and DNS cache counts. `sharding.shards` is 1 for that
-reason and should stay 1.
+The e2 vCPUs are shared and guarantee 50% of CPU time each. That matched the
+old belief that the crawl was network-bound and could not use more than one
+core. On t2d the link is not the constraint: 12.0 Mbps used against 1,570
+available, 0.8%. The reactor is, and two dedicated cores let two shards run at
+53.09 pages/s against 25.51 for one, a 2.08x gain.
 
-`e2-small` costs $0.80 less over 48 hours but has 2 GB against a measured
-1.5 GB working set. Half a gigabyte of headroom is not enough for a 48 hour
-run whose RSS trend nobody has measured to the end.
+The disqualifying reason is memory. `memory.memusage_limit_mb` is 3000 **per
+process**, so two shards need 6 GB before the guard fires. On a 4 GB e2-medium
+the guard could never fire and the OOM killer would arrive first, which is the
+exact failure `config.toml` sizes that limit to avoid: a SIGKILL loses the log
+flush and the persisted dupefilter.
 
 **Do not use a Spot instance.** Spot VMs terminate at 24 hours whatever
 happens, so a 48 hour run is guaranteed to be cut in half. The saving is
@@ -73,7 +76,7 @@ project.
 
 ```bash
 gcloud compute instances create crawler \
-  --machine-type=e2-medium \
+  --machine-type=t2d-standard-2 \
   --zone=us-central1-a \
   --image-family=ubuntu-2404-lts-amd64 \
   --image-project=ubuntu-os-cloud \
@@ -81,20 +84,28 @@ gcloud compute instances create crawler \
   --boot-disk-type=pd-balanced
 ```
 
-60 GB is sized from measurements, not guessed:
+60 GB is sized from measurements, not guessed. **Every per-process figure is
+counted twice, because `sharding.shards` is 2 and each shard has its own
+JOBDIR.** Counting the frontier once was an error that hid 13 GB.
 
 | | |
 |---|---|
-| Frontier ceiling under `state/job` | 12.3 GB |
-| Logs, gzipped, at 54 pages/s | 7.3 GB |
-| `collect()` copy into `data/run-<stamp>/` | 7.3 GB |
+| Frontier ceiling, 2 x `state/job-N` | 13.2 GB |
+| Logs, gzipped, at 53 pages/s | 7.3 GB |
+| `dispatched.log.gz`, all requests | 1.0 GB |
+| `collect()` copy into `data/run-<stamp>/` | 8.3 GB |
 | OS, uv, venv | 8 GB |
-| **Total** | **35 GB** |
+| **Total** | **37.8 GB** |
 
 The log figures come from a real run: `discovered.log.gz` held 4,075,529 lines
 in 43,961,228 bytes, so a discovered URL costs 10.79 bytes compressed and a
-crawled page costs 31.87. The frontier ceiling is `frontier_max_size` times the
-660 bytes per request that a measured run showed.
+crawled page costs 31.87. The frontier ceiling is `frontier_max_size` (10M per
+process, halved from 20M for exactly this reason) times the 660 bytes per
+request a measured run showed, times two shards.
+
+`ops/run_hour.sh` samples free disk every 30s into `resources.tsv` and stops
+the run below `MIN_DISK_FREE_MB` (3000). A full disk fails the gzip writers and
+the JOBDIR write path at the same moment, which kills both shards at once.
 
 The default 10 GB boot disk would fill during the run. Disk is $0.0027 per GB
 over 48 hours, so the headroom is nearly free.
@@ -182,8 +193,7 @@ is live, before committing hours:
 ```bash
 cd ~/ntu-sa-crawler
 export PATH="$HOME/.local/bin:$PATH"
-uv run python tests/test_dispatch.py
-uv run python tests/test_handoff.py
+for t in tests/test_*.py; do uv run python "$t" || break; done
 ```
 
 ## The ten minute test
@@ -225,6 +235,61 @@ so pages/s alone does not settle anything over ten minutes.
 
 Use `tmux` so a dropped SSH session does not take the crawl with it. The run
 writes continuously, so nothing is lost by disconnecting.
+
+### The 20 minute smoke, before any 48 hour commitment
+
+Twenty minutes is chosen, not rounded: at ~53 pages/s two shards send roughly
+60,000 requests, and the one short gap ever recorded appeared at a rate of
+1 in 32,000. A shorter run cannot see it.
+
+```bash
+tmux new -d -s smoke "export PATH=\$HOME/.local/bin:\$PATH; \
+  cd ~/ntu-sa-crawler && ops/run_hour.sh 1200 > /tmp/smoke.log 2>&1"
+tmux attach -t smoke        # detach with ctrl-b d
+```
+
+Every one of these must pass. Any failure means do not start the 48 hour run.
+
+```bash
+cd ~/ntu-sa-crawler && export PATH=$HOME/.local/bin:$PATH
+uv run python ops/verify_politeness.py                      # VIOLATIONS : 0
+uv run python ops/verify_politeness.py --source crawled     # VIOLATIONS : 0
+uv run python ops/verify_robots.py --hosts 100              # VIOLATIONS : 0
+wc -c data/violation-trace-*.log                            # 0 bytes each
+grep -c "Dumping Scrapy stats" data/run-*/scrapy-*.log      # 1 per shard
+ls state/job-*/requests.bloom                               # one per shard
+ls -la data/stats-*.json                                    # one per shard
+cat data/run-*/supervisor.log                               # empty
+tail -3 data/run-*/resources.tsv                            # rss per shard, disk free
+```
+
+The default `--source dispatched` is the one that matters. It reads
+`data/dispatched*.log.gz`, which holds every request the crawler sent,
+including robots.txt and the ones that failed. `--source crawled` reads the
+older log, which holds parseable responses only.
+
+### The 48 hour run
+
+```bash
+tmux new -d -s crawl48 "export PATH=\$HOME/.local/bin:\$PATH; \
+  cd ~/ntu-sa-crawler && ops/run_hour.sh 172800 > /tmp/crawl48.log 2>&1"
+```
+
+Check once a day:
+
+```bash
+tail -2 data/run-*/resources.tsv       # RSS per shard, free disk
+cat data/run-*/supervisor.log          # restarts; should stay empty
+wc -c data/violation-trace-*.log       # must stay 0
+tail -5 /tmp/crawl48.log
+```
+
+If the supervisor itself dies but the machine is fine, restart without losing
+the frontier:
+
+```bash
+RESUME=1 ops/run_hour.sh <remaining_seconds>
+```
 
 ## Watching from outside
 

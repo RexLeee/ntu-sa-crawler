@@ -319,6 +319,58 @@ def test_spider_partitions_and_hands_over() -> bool:
     return True
 
 
+def test_foreign_inbox_urls_are_refused() -> bool:
+    """A shard must drop inbox URLs it does not own.
+
+    _drain_handoff used to trust the sender. A stale inbox is enough to break
+    that trust: the files are written under the shard count of whichever run
+    created them, so restarting with a different count redirects every URL
+    already sitting there. Two processes on one domain each run their own 5
+    second timer with no shared state able to notice, which is the one failure
+    mode sharding must not have.
+    """
+    from scrapy.utils.test import get_crawler
+
+    from crawler.spiders.broad import BroadSpider
+
+    urls = [f"https://{d}/page" for d in _domains(200)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        crawler = get_crawler(BroadSpider, {"DUPEFILTER_CLASS": None})
+        crawler._apply_settings()
+        spider = BroadSpider(shard=0, shards=2)
+        spider.handoff = Handoff(0, 2, Path(tmp))
+
+        # Deliver every URL to shard 0 regardless of who owns it, which is
+        # what a stale inbox looks like.
+        admitted: list[str] = []
+        spider._admit = lambda url, key: admitted.append(url)  # noqa: ARG005
+        spider.handoff.poll = lambda limit: urls  # noqa: ARG005
+        spider.crawler = crawler
+        spider._drain_handoff()
+
+        foreign = [u for u in urls if shard_of(slot_key(u), 2) != 0]
+        mine = [u for u in urls if shard_of(slot_key(u), 2) == 0]
+        if not foreign:
+            print("FAIL: test data has no foreign urls, nothing was exercised")
+            return False
+        if sorted(admitted) != sorted(mine):
+            print(
+                f"FAIL: admitted {len(admitted)} urls, shard 0 owns {len(mine)}; "
+                f"{len(set(admitted) & set(foreign))} were foreign"
+            )
+            return False
+        if spider.handoff_foreign != len(foreign):
+            print(
+                f"FAIL: counted {spider.handoff_foreign} foreign urls, "
+                f"expected {len(foreign)}"
+            )
+            return False
+
+    print(f"PASS: {len(foreign)} foreign inbox urls refused and counted")
+    return True
+
+
 def main() -> int:
     results = [
         test_stable_across_processes(),
@@ -327,6 +379,7 @@ def main() -> int:
         test_poll_does_not_redeliver(),
         test_partial_line_is_not_delivered(),
         test_spider_partitions_and_hands_over(),
+        test_foreign_inbox_urls_are_refused(),
     ]
     return 0 if all(results) else 1
 

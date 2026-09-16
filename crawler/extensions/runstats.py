@@ -31,6 +31,7 @@ few microseconds per sample.
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import threading
@@ -56,6 +57,11 @@ COLUMNS = (
     "dl_transferring",
     "scraper_queued",
     "scraper_active_kb",
+    # Stop-the-world collector pauses, on the reactor thread. 1.7M protego
+    # objects are walked on every gen-2 pass, so these say whether the lag
+    # above is the collector or the parser.
+    "gc_max_ms",
+    "gc_total_ms",
     "frontier",
     "pqueues",
     "robots_cached",
@@ -99,10 +105,24 @@ def _read_rss_kb() -> float:
 class RunStats:
     """Samples the crawler's own internals on a fixed interval."""
 
-    def __init__(self, crawler, interval: float, objects_every: float):
+    def __init__(
+        self,
+        crawler,
+        interval: float,
+        objects_every: float,
+        gc_threshold0: int = 0,
+        gc_freeze: bool = False,
+    ):
         self.crawler = crawler
         self.interval = interval
         self.objects_every = objects_every
+        self.gc_threshold0 = int(gc_threshold0)
+        self.gc_freeze = bool(gc_freeze)
+
+        # Collector pauses, accumulated by the gc.callbacks hook below and
+        # drained on each sample.
+        self._gc_started: float | None = None
+        self._gc_pauses: list[float] = []
 
         self._ticks_per_sec = float(os.sysconf("SC_CLK_TCK"))
         self._proc_stat = "/proc/self/stat"
@@ -127,6 +147,7 @@ class RunStats:
         # between N processes would interleave their rows.
         self._path = None
         self._objects_path = None
+        self._stats_json_path = None
         self._fh = None
 
         self._stats_loop = None
@@ -136,7 +157,13 @@ class RunStats:
     def from_crawler(cls, crawler):
         cfg_interval = crawler.settings.getfloat("RUNSTATS_INTERVAL", 30.0)
         cfg_objects = crawler.settings.getfloat("RUNSTATS_OBJECTS_INTERVAL", 600.0)
-        ext = cls(crawler, cfg_interval, cfg_objects)
+        ext = cls(
+            crawler,
+            cfg_interval,
+            cfg_objects,
+            crawler.settings.getint("GC_THRESHOLD0", 0),
+            crawler.settings.getbool("GC_FREEZE_AT_START", False),
+        )
         crawler.signals.connect(ext.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signal=signals.spider_closed)
         return ext
@@ -152,16 +179,47 @@ class RunStats:
         suffix = f"-{spider.shard}" if getattr(spider, "shards", 1) > 1 else ""
         self._path = d / f"runstats{suffix}.tsv"
         self._objects_path = d / f"objects{suffix}.log"
+        self._stats_json_path = d / f"stats{suffix}.json"
         self._fh = self._path.open("a", encoding="utf-8")
         if self._path.stat().st_size == 0:
             self._fh.write("\t".join(COLUMNS) + "\n")
             self._fh.flush()
 
+        self._tune_gc()
         self._lag_loop = create_looping_call(self._tick_lag)
         self._lag_loop.start(self._lag_interval, now=False)
         self._stats_loop = create_looping_call(self._sample)
         self._stats_loop.start(self.interval, now=False)
         logger.info("runstats writing to %s every %.0fs", self._path, self.interval)
+
+    def _tune_gc(self) -> None:
+        """Measure collector pauses, and optionally make them rarer.
+
+        The hook is two monotonic() calls per collection, so it stays on for
+        the whole run: the pauses land on the reactor thread, which is the
+        thread the per-domain timers and every TLS handshake live on, and
+        without the measurement a lag spike cannot be attributed.
+        """
+        gc.callbacks.append(self._on_gc)
+        if self.gc_freeze:
+            # Everything imported and built so far is long-lived. Freezing it
+            # keeps gen-2 passes from traversing the interpreter, Scrapy and
+            # protego's already-built rule objects.
+            gc.collect()
+            gc.freeze()
+        if self.gc_threshold0 > 0:
+            _, gen1, gen2 = gc.get_threshold()
+            gc.set_threshold(self.gc_threshold0, gen1, gen2)
+        logger.info(
+            "gc thresholds=%s frozen=%d", gc.get_threshold(), gc.get_freeze_count()
+        )
+
+    def _on_gc(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._gc_started = time.monotonic()
+        elif self._gc_started is not None:
+            self._gc_pauses.append(time.monotonic() - self._gc_started)
+            self._gc_started = None
 
     def spider_closed(self, spider) -> None:
         for loop in (self._stats_loop, self._lag_loop):
@@ -171,6 +229,8 @@ class RunStats:
             self._sample()
             self._fh.close()
             self._fh = None
+        if self._on_gc in gc.callbacks:
+            gc.callbacks.remove(self._on_gc)
 
     # --- measurement --------------------------------------------------------
 
@@ -243,6 +303,11 @@ class RunStats:
         lag_max = lags[-1] * 1000 if lags else 0.0
         lag_p50 = lags[len(lags) // 2] * 1000 if lags else 0.0
 
+        pauses = self._gc_pauses
+        self._gc_pauses = []
+        gc_max = max(pauses) * 1000 if pauses else 0.0
+        gc_total = sum(pauses) * 1000
+
         dl_active, dl_slots, dl_transferring = self._downloader_numbers()
         scraper_queued, scraper_kb = self._scraper_numbers()
         frontier, pqueues = self._frontier_numbers()
@@ -277,6 +342,8 @@ class RunStats:
             str(dl_transferring),
             str(scraper_queued),
             f"{scraper_kb:.0f}",
+            f"{gc_max:.0f}",
+            f"{gc_total:.0f}",
             str(frontier),
             str(pqueues),
             str(robots_cached),
@@ -292,11 +359,37 @@ class RunStats:
         )
         self._fh.write("\t".join(row) + "\n")
         self._fh.flush()
+        self._dump_stats_json()
         self._last_sample = now
 
         if now - self._last_objects >= self.objects_every:
             self._last_objects = now
             self._dump_objects(now - self._start)
+
+    def _dump_stats_json(self) -> None:
+        """Snapshot the whole stats dict beside the TSV row.
+
+        Scrapy writes its stats once, at a clean spider close. Every run before
+        the timed shutdown existed was SIGKILLed first, so response_status_count
+        and exception_type_count -- the only per-status and per-error-type
+        breakdowns anywhere -- never reached disk, and the ~22% of failing
+        requests could not be classified.
+
+        The timed shutdown should make the dump happen now. This is the
+        backstop, because a run that dies some other way still has to produce a
+        report. Written to a temp file and renamed so a kill mid-write leaves
+        the previous snapshot intact rather than a truncated one.
+        """
+        if self._stats_json_path is None:
+            return
+        try:
+            stats = dict(self.crawler.stats.get_stats())
+            stats["snapshot_ts"] = time.time()
+            tmp = Path(str(self._stats_json_path) + ".tmp")
+            tmp.write_text(json.dumps(stats, indent=1, default=str), encoding="utf-8")
+            os.replace(tmp, self._stats_json_path)
+        except Exception as exc:  # never let measurement kill the crawl
+            logger.warning("stats snapshot failed: %s", exc)
 
     def _dump_objects(self, elapsed: float) -> None:
         """Type histogram of live objects.

@@ -168,6 +168,11 @@ CPU 那一列是佐證。分片之後沒有任何 process 接近飽和，
 **1. 例外率。** 需要獨立調查。大部分可能是 robots 嚴格模式的刻意拒絕，
 那是刻意的行為，不是故障。要先把例外分類才知道。
 
+現在有資料可以做這件事了。`exception_type_count/*` 在 stats dump 裡，
+而 stats dump 以前每次都被 SIGKILL 吃掉。`crawler/extensions/shutdown.py`
+讓 crawl 自己在 `RUN_DURATION` 到時關閉，`runstats.py` 另外每 30 秒把
+整包 stats 寫成 `data/stats-N.json` 當備援。
+
 **2. Windows Update 還沒暫停。** 沒有命令列做法，要使用者手動到
 設定 → Windows Update → 進階選項，暫停到 9/20 之後。更新會自動重開機。
 
@@ -185,7 +190,8 @@ huang.Taiyi@gmail.com。
 ```bash
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
 uv run python tests/test_handoff.py       # 6 個檢查
-uv run python tests/test_dispatch.py      # 5 個情境
+uv run python tests/test_dispatch.py      # 3 個情境 + 守門員 + 分組鍵
+uv run python tests/test_downloader.py    # 延遲從回應結束起算，這是核心不變量
 uv run python tests/test_pqueue.py        # 7 個檢查
 uv run python tests/test_scheduler.py     # 5 個檢查
 uv run python tests/test_robots_cache.py  # 7 個檢查
@@ -199,15 +205,39 @@ uvx ruff check crawler/ tests/ ops/
 
 ```bash
 export PATH=$HOME/.local/bin:$PATH; cd ~/ntu-sa-crawler
-uv run python ops/verify_politeness.py    # 必須 VIOLATIONS : 0
-uv run python ops/verify_robots.py        # 必須 VIOLATIONS : 0
+# 預設讀 data/dispatched*.log.gz，涵蓋 robots.txt 與失敗的請求
+uv run python ops/verify_politeness.py                    # 必須 VIOLATIONS : 0
+uv run python ops/verify_politeness.py --source crawled   # 必須 VIOLATIONS : 0
+uv run python ops/verify_robots.py --hosts 100            # 必須 VIOLATIONS : 0
 uv run python ops/verify_no_refetch.py    # 目前約 1.4%，見上面的轉址說明
-uv run python ops/report_metrics.py
+uv run python ops/report_metrics.py --json data/run-<stamp>/metrics.json
+uv run python ops/report_timeline.py data/run-<stamp>
 ```
 
-還要看 `data/violation-trace.log`。**它現在必須是 0 bytes。**
-以前它和驗證器分組方式不同，所以空的不代表沒問題；現在兩邊同一個定義，
-裡面有東西就是真的違規。
+乾淨關閉與存檔完整性，每一項都要過：
+
+```bash
+# stats.json 裡的 finish_reason 才是乾淨關閉的證據。
+# "Dumping Scrapy stats" 那行是 INFO，log_level 是 WARNING，永遠不會出現。
+grep -h finish_reason data/run-*/stats-*.json            # 每個 shard 一個
+ls state/job-*/requests.bloom                            # 每個 shard 一個
+cat data/run-*/supervisor.log                            # 應該是空的
+tail -3 data/run-*/resources.tsv                         # 看 RSS 與 disk_free_mb
+```
+
+還要看兩個東西，兩個都必須是空的：
+
+- `data/violation-trace-*.log` **必須是 0 bytes**。
+- `data/stats-*.json` 裡的 `dispatch/guard_refused` **必須是 0 或不存在**。
+
+這兩個現在是同一件事。`crawler/dispatch.py` 的守門員只要看到間隔小於 5.0 秒，
+就寫一筆 trace、加一次 `guard_refused`，並且**丟掉那個請求**。
+節流由 `crawler/downloader.py` 做，它從「上一個回應結束」起算，
+所以守門員在設計上不可能觸發。觸發就是有 bug，要先查清楚再跑正式的。
+
+trace 的門檔現在固定是 `required_min_gap`，不再隨 robots.txt 的 Crawl-delay
+浮動，所以不需要看 `applicable_floor` 那一欄了。網站要求的 Crawl-delay
+寫進 `slot.delay`，由同一個「回應結束起算」的機制保證。
 
 **politeness 不可妥協。** 作業寫「NO violation」。`verify_politeness.py`
 比對的是 `required_min_gap`（5.0），不是 `download_delay`（5.1），

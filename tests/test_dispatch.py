@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
-"""Prove the dispatch timer measures and enforces real request spacing.
+"""Prove the dispatch record measures real spacing, and the guard refuses.
 
 Run directly: uv run python tests/test_dispatch.py
 
-Uses a local HTTP server so the assertion depends on Scrapy's scheduling only,
-not on any external site. Four requests share one download slot, so their
-transfer starts must be DOWNLOAD_DELAY apart.
+crawler/dispatch.py no longer throttles. The throttle is
+crawler/downloader.py, covered by tests/test_downloader.py; this file covers
+what dispatch.py still owns:
 
-The enforcement half matters because Scrapy's own spacing is not sufficient
-under load: Slot._process_queue stamps lastseen when it schedules the download
-coroutine, not when the coroutine runs, and at high concurrency the event loop
-can be blocked in between. To prove the floor works independently, the second
-test configures a DOWNLOAD_DELAY *below* the floor and checks the gaps still
-come out above it.
+  * the stamp and the dispatch log, on a live crawl against a local server
+  * the grouping key, which must come from the URL and never from meta
+  * the guard, which refuses a dispatch that lands under the floor
 
-The fourth scenario covers the other way a gap can collapse: the requests are
-correctly spaced, but grouped under the wrong domain. A request built by
-MetaRefreshMiddleware carries a copy of the *source* page's meta, including
-its download_slot, so it queues on the source domain's timer and ignores the
-target's. Sending four requests to one host under four different foreign slot
-keys reproduces that.
+Scenario 1 measures spacing on the real Downloader subclass.
+Scenario 2 reproduces the slot-GC violation from a two hour run. Scrapy's
+Downloader._slot_gc destroys any slot idle for 60s, and slot.lastseen lives
+on the Slot, so a rebuilt slot starts with no history and dispatches at once.
+Two requests to panasonic.jp went out 0.001s apart that way. This scenario
+collects the slot between every request, and passes only because
+DomainSlotDownloader keeps the completion time outside the slot and seeds a
+rebuilt one from it. Written after the guard caught exactly this during the
+rewrite.
+Scenario 3 reproduces the meta refresh violation. MetaRefreshMiddleware
+builds its target with source.replace(), copying the source page's
+download_slot, so the target queued on the wrong domain's timer. Sending four
+requests to one host under four different foreign slot keys reproduces it.
 """
 
 from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -35,27 +40,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scrapy import Request, Spider  # noqa: E402
 from scrapy.crawler import CrawlerProcess  # noqa: E402
 
-from crawler.dispatch import DISPATCH_TIME, install  # noqa: E402
+from crawler.dispatch import DISPATCH_TIME, close_dispatch_log, configure  # noqa: E402
+from crawler.logwriter import read_lines  # noqa: E402
 
 REQUESTS = 4
 TOLERANCE = 0.05
 
-# Scenario 1 measures Scrapy's own spacing: the floor is off, so the gaps can
-# only come from DOWNLOAD_DELAY.
-# Scenario 2 proves the floor stands on its own: DOWNLOAD_DELAY is set below
-# it, so any gap at or above the floor must come from dispatch.py.
-# Scenario 3 reproduces a real violation from a two hour run. Scrapy's
-# Downloader._slot_gc destroys any slot idle for 60s. The floor used to be
-# keyed by id(slot), and CPython reuses a freed object's address immediately
-# (measured: 1,999 reuses in 2,000 allocations), so a domain that went quiet
-# and came back lost its gap entirely: two requests to panasonic.jp dispatched
-# 0.001s apart. Here the slot is collected between every request.
-# Scenario 4 reproduces the meta refresh violation. See _foreign_meta below.
 SCENARIOS = {
-    "measure": {"delay": 2.0, "floor": 0.0, "expect": 2.0},
-    "enforce": {"delay": 0.5, "floor": 2.0, "expect": 2.0},
-    "slot_gc": {"delay": 0.0, "floor": 2.0, "expect": 2.0, "gc_slots": True},
-    "foreign_meta": {"delay": 0.0, "floor": 2.0, "expect": 2.0, "foreign_meta": True},
+    "measure": {"delay": 2.0, "expect": 2.0},
+    "slot_gc": {"delay": 2.0, "expect": 2.0, "gc_slots": True},
+    "foreign_meta": {"delay": 2.0, "expect": 2.0, "foreign_meta": True},
 }
 
 observed: list[float] = []
@@ -165,12 +159,21 @@ def _force_slot_gc_between_requests() -> None:
 def run_scenario(name: str) -> int:
     """Crawl once under one scenario and check the gaps. Runs in a subprocess.
 
-    A subprocess per scenario is needed because install() is idempotent by
-    design: the monkey-patch must not stack, so one process can only ever hold
-    one floor value.
+    A subprocess per scenario because configure() holds module state: one
+    process can only ever hold one floor and one set of log files.
     """
     cfg = SCENARIOS[name]
-    install(cfg["floor"])
+    # Every scenario writes the dispatch log, so its coverage is checked
+    # alongside the gaps rather than in a test of its own. The production log
+    # must hold one line per dispatch including robots.txt and failures, and a
+    # silent regression there would remove the compliance evidence.
+    log_dir = Path(tempfile.mkdtemp(prefix="dispatchlog-"))
+    log_path = log_dir / "dispatched.log.gz"
+    trace_path = log_dir / "violation-trace.log"
+    # The floor sits just under the delay. The guard must not fire on gaps the
+    # throttle produced correctly, and a floor equal to the delay would make
+    # every scheduling rounding error a refusal.
+    configure(cfg["delay"] - 0.5, str(trace_path), str(log_path))
 
     if cfg.get("gc_slots"):
         _force_slot_gc_between_requests()
@@ -179,12 +182,13 @@ def run_scenario(name: str) -> int:
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    settings = {"LOG_LEVEL": "ERROR", "DOWNLOAD_DELAY": cfg["delay"]}
-    if cfg.get("foreign_meta"):
-        # The floor alone is not enough. A request carrying a foreign slot key
-        # would still occupy the wrong Scrapy slot, so both halves of the fix
-        # have to be in place for the gaps to hold.
-        settings["DOWNLOADER"] = "crawler.downloader.DomainSlotDownloader"
+    settings = {
+        "LOG_LEVEL": "ERROR",
+        "DOWNLOAD_DELAY": cfg["delay"],
+        # The subclass is what throttles and what derives the slot key, so
+        # every scenario needs it.
+        "DOWNLOADER": "crawler.downloader.DomainSlotDownloader",
+    }
 
     process = CrawlerProcess(settings=settings)
     _Spider.chained = bool(cfg.get("gc_slots"))
@@ -214,7 +218,7 @@ def run_scenario(name: str) -> int:
     gaps = [b - a for a, b in zip(observed, observed[1:], strict=False)]
     expect = cfg["expect"]
     print(
-        f"[{name}] delay={cfg['delay']}s floor={cfg['floor']}s "
+        f"[{name}] delay={cfg['delay']}s "
         f"gaps: {', '.join(f'{g:.3f}s' for g in gaps)}"
     )
 
@@ -224,91 +228,154 @@ def run_scenario(name: str) -> int:
         return 1
 
     print(f"PASS [{name}]: every gap held at or above {expect}s")
+
+    close_dispatch_log()
+
+    # The guard must not have fired. These gaps were produced correctly, so an
+    # entry here would mean the guard and the throttle disagree about what a
+    # gap is, which would cost real pages in production.
+    if trace_path.exists() and trace_path.stat().st_size:
+        print(f"FAIL [{name}]: the guard traced a short gap on a compliant run")
+        print(trace_path.read_text(encoding="utf-8")[:400])
+        return 1
+    print(f"PASS [{name}]: the guard stayed silent")
+
+    logged = [ln for ln in read_lines(log_path) if ln.strip()]
+    if len(logged) < REQUESTS:
+        print(
+            f"FAIL [{name}]: dispatch log holds {len(logged)} lines, "
+            f"expected at least {REQUESTS}"
+        )
+        return 1
+    # Column 2 is the slot the timer grouped by, which is what
+    # ops/verify_politeness.py --source dispatched reads.
+    keys = {ln.split("\t")[1] for ln in logged}
+    if keys != {"127.0.0.1"}:
+        print(f"FAIL [{name}]: dispatch log grouped under {keys}, expected 127.0.0.1")
+        return 1
+    print(f"PASS [{name}]: dispatch log holds {len(logged)} lines, all one slot")
     return 0
 
 
-def test_reservation_never_moves_backwards() -> int:
-    """A dispatch must not overwrite a sibling's later reserved turn.
+def test_guard_refuses_a_short_gap() -> int:
+    """A dispatch under the floor must raise, and be traced and counted.
 
-    Each coroutine claims its turn before awaiting, writing turn + gap into
-    the shared dict. When it finally dispatches it writes again, from the real
-    dispatch time. That second write used to be unconditional, so a coroutine
-    that dispatched while a sibling held a later reservation would replace the
-    sibling's value with a smaller one. The next arrival then claimed the turn
-    the sibling was already sleeping on, and the two went out together.
-
-    Checked on the dict itself rather than through a crawl, because the losing
-    interleaving depends on event loop timing that a test cannot force
-    reliably. What it can assert is the invariant: the stored value never
-    decreases.
+    Under the completion-anchored throttle this cannot happen, so the guard is
+    a backstop for a defect. It has fired for real three times on this crawl
+    under earlier designs, which is why it stays: dropping one page is much
+    cheaper than one violation.
     """
-    import asyncio
+    from scrapy.exceptions import IgnoreRequest
+    from scrapy.settings import Settings
+    from scrapy.statscollectors import StatsCollector
 
-    import scrapy.core.downloader as dl
+    from crawler import dispatch as mod
 
-    async def noop(self, slot, request):
-        return None
+    class _FakeCrawler:
+        settings = Settings()
+        spider = None
 
-    dl.Downloader._download = noop
-    install(5.0)
-    patched = dl.Downloader._download
-
-    # The claim dict is the only empty dict in the closure.
-    reservations = next(
-        cell.cell_contents
-        for cell in patched.__closure__
-        if isinstance(cell.cell_contents, dict) and not cell.cell_contents
-    )
-
-    class _Slot:
-        pass
+    tmp = Path(tempfile.mkdtemp(prefix="guard-"))
+    trace = tmp / "violation-trace.log"
+    stats = StatsCollector(_FakeCrawler())
+    mod.configure(5.0, str(trace), None)
+    mod.set_stats(stats)
 
     class _Req:
         def __init__(self, url):
             self.url = url
-            self.meta = {"download_slot": "d.example"}
+            self.meta = {}
 
-    seen: list[float] = []
+    failures = 0
 
-    async def watch():
-        # Sample the reservation while three requests claim and dispatch.
-        for _ in range(60):
-            value = reservations.get("d.example")
-            if value is not None:
-                seen.append(value)
-            await asyncio.sleep(0.05)
+    first = _Req("https://guard.test/a")
+    mod.record_dispatch(first)
+    if DISPATCH_TIME not in first.meta:
+        print("FAIL [guard]: the first dispatch was not stamped")
+        failures += 1
 
-    async def drive():
-        await asyncio.gather(
-            *(patched(None, _Slot(), _Req(f"https://d.example/{i}")) for i in range(3)),
-            watch(),
-        )
+    # Immediately after, so the gap is ~0s against a 5s floor.
+    second = _Req("https://guard.test/b")
+    try:
+        mod.record_dispatch(second)
+    except IgnoreRequest:
+        print("PASS [guard]: a 0s gap raised IgnoreRequest")
+    else:
+        print("FAIL [guard]: a 0s gap was allowed through")
+        failures += 1
 
-    asyncio.run(drive())
+    refused = stats.get_value("dispatch/guard_refused")
+    if refused != 1:
+        print(f"FAIL [guard]: dispatch/guard_refused is {refused}, expected 1")
+        failures += 1
+    else:
+        print("PASS [guard]: the refusal reached stats")
 
-    drops = [
-        (a, b) for a, b in zip(seen, seen[1:], strict=False) if b < a - 1e-9
-    ]
-    if drops:
-        a, b = drops[0]
-        print(
-            f"FAIL [reservation]: value moved backwards, {a:.6f} -> {b:.6f} "
-            f"({len(drops)} times)"
-        )
-        return 1
-    print(f"PASS [reservation]: never decreased across {len(seen)} samples")
-    return 0
+    mod.close_dispatch_log()
+    text = trace.read_text(encoding="utf-8") if trace.exists() else ""
+    if "SHORT GAP" not in text:
+        print(f"FAIL [guard]: nothing traced:\n{text[:300]}")
+        failures += 1
+    else:
+        print("PASS [guard]: the refusal was traced")
+
+    # A different domain must be unaffected: the history is per domain, and
+    # grouping everything together would refuse legitimate traffic.
+    other = _Req("https://other.test/a")
+    try:
+        mod.record_dispatch(other)
+    except IgnoreRequest:
+        print("FAIL [guard]: a different domain was refused")
+        failures += 1
+    else:
+        print("PASS [guard]: a different domain dispatched freely")
+
+    return 1 if failures else 0
+
+
+def test_key_comes_from_the_url_not_meta() -> int:
+    """The guard must group by the URL's domain, never by meta.
+
+    A redirect or a meta refresh builds its target with source.replace(),
+    which copies meta wholesale. A guard reading meta['download_slot'] would
+    therefore check a target request against the source domain's history. A
+    10 minute run produced six violations that way, all invisible to the
+    check for exactly this reason.
+    """
+    from scrapy.exceptions import IgnoreRequest
+
+    from crawler import dispatch as mod
+
+    mod.configure(5.0, None, None)
+
+    class _Req:
+        def __init__(self, url, slot):
+            self.url = url
+            self.meta = {"download_slot": slot}
+
+    # Two requests to ONE domain, carrying two different foreign slot keys.
+    # Grouping by meta would see two domains and allow both.
+    mod.record_dispatch(_Req("https://same.test/a", "foreign1.example"))
+    try:
+        mod.record_dispatch(_Req("https://same.test/b", "foreign2.example"))
+    except IgnoreRequest:
+        print("PASS [key]: two foreign meta keys still grouped by the URL")
+        return 0
+    print("FAIL [key]: meta['download_slot'] split one domain into two")
+    return 1
 
 
 def main() -> int:
-    if len(sys.argv) == 2 and sys.argv[1] == "reservation":
-        return test_reservation_never_moves_backwards()
+    if len(sys.argv) == 2 and sys.argv[1] == "guard":
+        return test_guard_refuses_a_short_gap()
+    if len(sys.argv) == 2 and sys.argv[1] == "key":
+        return test_key_comes_from_the_url_not_meta()
     if len(sys.argv) > 1:
         return run_scenario(sys.argv[1])
 
     # Parent: run each scenario in its own interpreter.
     failures = 0
-    for name in [*SCENARIOS, "reservation"]:
+    for name in [*SCENARIOS, "guard", "key"]:
         result = subprocess.run([sys.executable, __file__, name], check=False)
         failures += result.returncode != 0
     return 1 if failures else 0

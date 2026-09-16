@@ -8,45 +8,75 @@ bot_name = "ntu-sa-crawler"
 user_agent = "ntu-sa-crawler/1.0 (NTU IM academic course project; contact: r14725023@ntu.edu.tw)"
 
 [politeness]
-# 0.2 qps per registered domain is a 5.0s gap, but 5.0 exactly does not hold.
+# 0.2 qps per registered domain is a 5.0s gap. This is the delay Scrapy's own
+# per-slot timer applies, and crawler/downloader.py is what makes it hold.
 #
-# Scrapy's Slot._process_queue sets slot.lastseen to the moment it SCHEDULES
-# the download coroutine, while the socket write happens whenever the event
-# loop gets round to running it. At high concurrency the loop is sometimes
-# busy: a measured run saw single pauses up to 1.4s. When the first request of
-# a pair is delayed and the second is not, the gap the SERVER sees is shorter
-# than 5.0s. That run produced 50 real violations, the worst at 4.694s, a
-# 306 ms shortfall.
+# Scrapy spaces the POPS from a slot's queue, not the requests: _process_queue
+# writes slot.lastseen when it pops, then hands the download to the event
+# loop, which runs it whenever it gets there. A measured 20 minute run held
+# the reactor thread at 95-98% CPU with a 0.5s timer firing 1.3-4.6s late at
+# the median, so the pop-to-pop interval said almost nothing about the
+# interval the server saw. Earlier attempts to fix that with margin failed for
+# the same reason: at 5.5s the jitter tail (p50 36ms, p99 302ms, max 559ms)
+# still produced a 4.941s gap.
 #
-# A 5.5s margin cut 50 violations to 1, but the jitter is a long tail
-# (p50 36ms, p99 302ms, max 559ms), so no margin closes it reliably.
+# crawler/downloader.py advances slot.lastseen at the previous response's
+# COMPLETION instead. Every step then points the same way:
 #
-# crawler/dispatch.py enforces required_min_gap at the last point before the
-# socket write instead, which is exact. This value only has to schedule near
-# the target; the floor below is what guarantees compliance.
+#   pop(B) >= complete(A) + delay >= wire(A) + delay, and wire(B) >= pop(B)
+#
+# so reactor lateness can only widen the gap. This is Heritrix's min-delay-ms
+# and Nutch's FetchItemQueue semantics. 5.1 rather than 5.0 is clock-rounding
+# margin only; compliance no longer depends on it.
 download_delay = 5.1
-# The hard floor. crawler/dispatch.py holds every slot to this gap measured
-# from real dispatch to real dispatch, and ops/verify_politeness.py checks
-# against it rather than download_delay, so tuning the schedule can never
-# relax the test.
+# The floor the guard in crawler/dispatch.py refuses below, and the value
+# ops/verify_politeness.py checks against. Under the design above a dispatch
+# closer than this is impossible, so the guard firing means a defect: it drops
+# the page and counts dispatch/guard_refused, which the smoke acceptance list
+# requires to be 0.
 required_min_gap = 5.0
 # Scrapy randomizes delay to 0.5x-1.5x by default, which would produce 2.5s gaps.
 # Must stay 0 or we violate the rate limit.
 download_delay_jitter = 0.0
+# 1 is load-bearing rather than a tuning knob. It is what keeps a second
+# request for one domain from being popped while the first is still
+# transferring, and that is what makes the completion-anchored delay a
+# guarantee: two requests for one domain are never in flight together, so
+# there is no ordering between them to get wrong.
 concurrent_requests_per_domain = 1
-# Dump the timer and slot state whenever two dispatches on one domain land
-# closer than required_min_gap. This stayed empty through a run that the
-# offline check reported six violations for, and that contradiction is what
-# located the cause: the timer was spacing requests correctly but grouping
-# them by an inherited meta key rather than by the URL's domain. Both now use
-# slot_key(url), so anything written here is a real defect. The check is two
-# dict operations per dispatch and writes nothing unless a gap is short, so it
-# stays on for the 48 hour run.
+# Dump the request and the previous dispatch whenever two dispatches on one
+# domain land closer than required_min_gap. Such a dispatch is also refused.
+# The file has to be 0 bytes for the run to be accepted, so it is read as
+# proof: an entry means the guard caught something the design says cannot
+# happen. Two dict operations per dispatch, and it writes nothing unless a gap
+# is short, so it stays on for the whole 48 hours.
 trace_short_gaps = true
 obey_robotstxt = true
 # Treat eTLD+1 as the politeness unit. Includes PSL private domains, so
 # foo.blogspot.com and bar.blogspot.com count as separate domains.
 include_psl_private_domains = true
+# Record every dispatch to data/dispatched.log.gz, not only the fetches that
+# reach parse(). This is what the compliance claim rests on.
+#
+# data/crawled.log.gz is written from parse(), so it holds successful HTML
+# fetches only. It omits every failed request and every robots.txt fetch, and
+# both consumed a real turn on the domain's timer. In one measured run 40,957
+# of 45,825 robots fetches timed out, so the majority of what the crawler sent
+# was invisible to ops/verify_politeness.py.
+#
+# At ~9M requests over 48 hours this costs about 1 GB compressed, using the
+# same 10.79 bytes/line the discovered log measures.
+log_dispatches = true
+# Ceiling on a robots.txt Crawl-delay. Above this we knowingly under-honour:
+# one domain at 600s would hold frontier capacity for the whole run and return
+# 288 pages. A value inside the cap is applied to slot.delay and so gets the
+# same completion-anchored guarantee the 5.0s rule has.
+#
+# 60.0 also matters for slot collection. Downloader._slot_gc drops a slot
+# after 60s idle, which would lose its raised delay; capping Crawl-delay at
+# 60s means a rebuilt slot's first request is already at least that long
+# after the domain's last one.
+max_crawl_delay = 60.0
 
 [crawl]
 # Not "how many downloads run at once". Downloader.active counts a request
@@ -181,12 +211,14 @@ follow_meta_refresh = false
 # slightly, 79.6% against 77.9%, which is the opposite of the WSL result where
 # four shards dropped it from 48% to 28% by contending for a full link.
 #
-# It cost one politeness violation. See required_min_gap: the dispatch timer
-# reserves a turn, and a reactor stall between reserving and writing to the
-# socket shortens the gap the server sees. Median lag improved with sharding,
-# 1,900 ms against 2,164 ms, but the tail got worse on one shard, 12,091 ms
-# against 10,760 ms, and the tail is what breaks the gap. 32,000 requests
-# produced exactly one short gap, at 2.604s against the 5.0s floor.
+# Sharding never caused a violation, and the earlier note here that said it
+# did was wrong about the mechanism. Two short gaps were recorded on sharded
+# runs, 2.604s and 0.000520s, and both came from the old dispatch timer: two
+# coroutines for one domain could sleep at once, and asyncio.sleep is a lower
+# bound, so the one that claimed the later turn could wake first. That is a
+# single-process race which sharding only made more likely by raising the
+# tail of the reactor lag. crawler/downloader.py removed it by anchoring the
+# delay to the previous response's completion, which no lateness can shorten.
 shards = 2
 # How often each process drains the URLs other shards handed it. The poll is a
 # few file reads, and a URL waiting here is a domain not yet being crawled, so
@@ -246,12 +278,22 @@ bloom_error_rate = 1e-6
 # subclass. Dropped URLs are not marked as seen and can return later.
 #
 # Raised from 2M. The frontier lives on disk under JOBDIR, so the cost is not
-# memory: a measured run held 930k requests in 610 MB, about 660 bytes each,
-# and the disk has 950 GB free. At 2M the cap was reached in roughly an hour,
-# and after that every new URL was dropped, including the first URL of an
-# unseen domain. That is the one thing we cannot afford to drop, so
-# CappedScheduler now exempts it as well.
-frontier_max_size = 20_000_000
+# memory: a measured run held 930k requests in 610 MB, about 660 bytes each.
+# At 2M the cap was reached in roughly an hour, and after that every new URL
+# was dropped, including the first URL of an unseen domain. That is the one
+# thing we cannot afford to drop, so CappedScheduler now exempts it as well.
+#
+# 10M, not 20M. PER PROCESS, and that is what forced the change: at shards = 2
+# the machine holds two frontiers, so 20M each is 20M x 660 B x 2 = 26.4 GB.
+# The disk budget in ops/GCP_SETUP.md counted it once and arrived at 35 GB of
+# the 60 GB disk; counting it twice puts the total at 47 GB with no margin for
+# the logs the run is actually being kept for. At 10M the ceiling is 13.2 GB
+# total and the budget lands near 34 GB.
+#
+# Reaching the cap is not the failure mode it was. The frontier fills about
+# 33x faster than it drains, so the cap is reached either way; what matters is
+# that a new domain's first URL is exempt, which it is.
+frontier_max_size = 10_000_000
 # Hard stop below the 7.9 GB the t2d-standard-2 has. It has to stay below
 # physical RAM or it is not a guard at all: the OOM killer would SIGKILL the
 # process before Scrapy's MemoryUsage extension noticed, losing the log flush
@@ -276,6 +318,26 @@ frontier_max_size = 20_000_000
 # It has not been measured past ten minutes, so the 48 hour shape is still
 # unknown: hitting the cap ends that shard, which costs more than the RAM does.
 memusage_limit_mb = 3000
+# Python's cyclic collector walks every tracked container object on a gen-2
+# pass. This process holds a lot of them: objects-0.log recorded 848,879
+# protego _Rule plus 848,879 _URLPattern at the end of a 20 minute run, 1.7M
+# objects in two types alone. Every gen-2 pass is a stop-the-world pause on
+# the reactor thread, which is the thread the per-domain timers live on.
+#
+# 50_000 rather than the 700 default: gen-0 fires 71x less often, and a broad
+# crawl allocates enormous numbers of short-lived parse objects that are all
+# collected by reference counting anyway. Reported to cut GC from ~3% of
+# runtime to ~0.5% in a comparable workload.
+#
+# Compliance does not depend on this. The completion-anchored delay holds
+# through any pause; this is throughput and tail latency only. runstats
+# records gc_max_ms and gc_total_ms so the effect is measured rather than
+# assumed.
+gc_threshold0 = 50_000
+# Move everything alive at spider_opened into the permanent generation, so
+# gen-2 passes stop traversing the interpreter, Scrapy and the imported
+# libraries. Only the objects the crawl itself creates afterwards are walked.
+gc_freeze_at_start = true
 # 500 MB of runway below the limit, which lands in runstats well before the
 # hard stop at the slope this settles to.
 memusage_warning_mb = 2500

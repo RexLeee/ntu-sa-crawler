@@ -34,8 +34,6 @@ from crawler.slot import slot_key
 
 logger = logging.getLogger(__name__)
 
-MAX_CRAWL_DELAY = 60.0
-
 # _parsers stores None for a host whose robots.txt could not be fetched, so
 # None cannot double as "not cached". This sentinel distinguishes the two.
 _MISSING = object()
@@ -47,6 +45,12 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
     def __init__(self, crawler):
         super().__init__(crawler)
         self._floor_delay: float = crawler.settings.getfloat("DOWNLOAD_DELAY")
+        # A site asking for more than this is knowingly under-honoured: one
+        # domain at a 600s delay would hold frontier capacity for the whole run
+        # and yield 288 pages. Configured rather than hardcoded.
+        self._max_crawl_delay: float = crawler.settings.getfloat(
+            "MAX_CRAWL_DELAY", 60.0
+        )
 
         # The parent keeps every parser it has ever built in a plain dict keyed
         # by hostname, and never evicts. Measured sizes: 0.9 KB for a one-rule
@@ -210,9 +214,16 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
             return
 
         key = slot_key(request.url)
-        capped = min(requested, MAX_CRAWL_DELAY)
+        capped = min(requested, self._max_crawl_delay)
         self._pending_delays[key] = capped
         self._apply_delay(key, capped)
+        # slot.delay is now the only throttle, and it is sufficient.
+        # crawler/downloader.py makes _process_queue count the delay from the
+        # previous response's completion, so a reactor stall can only widen
+        # the gap. _pending_delays above replays the value if the slot is
+        # collected: Downloader._slot_gc drops a slot only after 60s idle,
+        # and max_crawl_delay caps a Crawl-delay at 60s, so a rebuilt slot's
+        # first request is already at least its own delay after the last one.
 
     def _apply_delay(self, key: str, delay: float) -> None:
         slot = self.crawler.engine.downloader.slots.get(key)

@@ -14,8 +14,9 @@ from scrapy import Request, Spider, signals
 from scrapy.exceptions import CloseSpider
 
 from crawler.config import PROJECT_ROOT, data_dir, load_config, state_dir
-from crawler.dispatch import DISPATCH_TIME
-from crawler.dispatch import install as install_dispatch_timer
+from crawler.dispatch import DISPATCH_TIME, close_dispatch_log
+from crawler.dispatch import configure as configure_dispatch
+from crawler.dispatch import set_stats as set_dispatch_stats
 from crawler.extract import find_base_href, iter_hrefs
 from crawler.filters import UrlFilter
 from crawler.handoff import Handoff
@@ -44,10 +45,19 @@ class BroadSpider(Spider):
         self.shards = int(shards)
         suffix = f"-{self.shard}" if self.shards > 1 else ""
 
-        trace = None
+        # The floor the guard in crawler/dispatch.py refuses below. The
+        # limiter itself is crawler/downloader.py, which counts the delay from
+        # the previous response's completion; this is the backstop that turns
+        # any remaining short gap into a dropped page rather than a violation.
+        self._trace_path = None
         if self.cfg["politeness"].get("trace_short_gaps", False):
-            trace = str(data_dir() / f"violation-trace{suffix}.log")
-        install_dispatch_timer(self.cfg["politeness"]["required_min_gap"], trace)
+            self._trace_path = str(data_dir() / f"violation-trace{suffix}.log")
+        # The complete record of what went out, including robots.txt and the
+        # requests that fail. crawled.log.gz cannot serve as compliance
+        # evidence on its own; see config.toml politeness.log_dispatches.
+        self._dispatch_log_path = None
+        if self.cfg["politeness"].get("log_dispatches", False):
+            self._dispatch_log_path = str(data_dir() / f"dispatched{suffix}.log.gz")
         self.filter = UrlFilter(self.cfg)
 
         limits = self.cfg["limits"]
@@ -59,6 +69,11 @@ class BroadSpider(Spider):
         self.dupefilter = None
         self.dupe_skipped = 0
         self.discovered_raw = 0
+        # Responses that arrived without a dispatch stamp, and URLs another
+        # shard sent us that we do not own. Both should stay at 0; anything
+        # else is a defect, so they are counted rather than ignored.
+        self.missing_stamp = 0
+        self.handoff_foreign = 0
 
         # Cross-shard URLs are handed to their owner rather than dropped. A
         # broad crawl discovers nearly every new domain through a cross-domain
@@ -89,6 +104,16 @@ class BroadSpider(Spider):
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
+        # Open the floor and the two diagnostic files here, before the engine
+        # and so before any dispatch can happen. crawler.stats does not exist
+        # yet in Scrapy 2.19 -- it is set when the crawl starts -- so the
+        # guard's counter is attached at spider_opened instead.
+        configure_dispatch(
+            spider.cfg["politeness"]["required_min_gap"],
+            spider._trace_path,
+            spider._dispatch_log_path,
+        )
+        crawler.signals.connect(spider._bind_dispatch_stats, signal=signals.spider_opened)
         # queued_per_domain counts requests waiting in the frontier, so every
         # request that leaves it has to release its slot. Without this the
         # counter only grows: an 87 minute run saw 9,684 downloads fail and
@@ -156,6 +181,16 @@ class BroadSpider(Spider):
 
         for url in urls:
             key = slot_key(url)
+            # Verify ownership rather than trust the sender. Two processes
+            # crawling one domain would each run their own 5s timer with no
+            # shared state able to notice, which is the one failure mode
+            # sharding must not have. A stale inbox is enough to cause it: the
+            # files are written under the modulus of whichever run created
+            # them, so restarting with a different shard count redirects every
+            # URL already sitting there.
+            if self.shards > 1 and shard_of(key, self.shards) != self.shard:
+                self.handoff_foreign += 1
+                continue
             if self.crawled_per_domain.get(key, 0) >= self.max_crawled_per_domain:
                 continue
             if self.queued_per_domain.get(key, 0) >= self.max_queued_per_domain:
@@ -163,6 +198,15 @@ class BroadSpider(Spider):
             request = self._admit(url, key)
             if request is not None:
                 self.crawler.engine.crawl(request)
+
+    def _bind_dispatch_stats(self, spider) -> None:
+        """Give the politeness guard somewhere to report refusals.
+
+        Separate from configure() because Crawler.stats raises until the crawl
+        starts, while the guard's floor and its log files have to be in place
+        before the Downloader exists.
+        """
+        set_dispatch_stats(self.crawler.stats)
 
     def _bind_dupefilter(self, spider) -> None:
         self.dupefilter = getattr(self.crawler, "bloom_dupefilter", None)
@@ -181,6 +225,8 @@ class BroadSpider(Spider):
         stats.set_value("domains/seen", len(self.seen_domains))
         stats.set_value("handoff/sent", self.handoff.sent)
         stats.set_value("handoff/received", self.handoff.received)
+        stats.set_value("handoff/foreign_dropped", self.handoff_foreign)
+        stats.set_value("dispatch/missing_stamp", self.missing_stamp)
 
     def _release_queued(self, key: str) -> None:
         remaining = self.queued_per_domain.get(key, 0) - 1
@@ -225,6 +271,7 @@ class BroadSpider(Spider):
     def closed(self, reason):
         self.crawled_log.close()
         self.discovered_log.close()
+        close_dispatch_log()
         logger.info(
             "closed(%s): crawled=%d discovered=%d domains=%d handoff_sent=%d "
             "handoff_received=%d",
@@ -248,15 +295,33 @@ class BroadSpider(Spider):
         # DOWNLOAD_DELAY spaces request starts apart, so compliance is measured
         # on dispatch time. See crawler/dispatch.py for why this is the only
         # correct source for it.
+        #
+        # No fallback to recv. A missing stamp used to be silently replaced by
+        # the receive time, which is always later than the real dispatch and so
+        # always widens the measured gap: the one case that could hide a
+        # violation was the one case the fallback covered up. Writing NA
+        # instead makes ops/verify_politeness.py count it and report it.
         recv = now()
-        sent = float(response.meta.get(DISPATCH_TIME, recv))
+        stamp = response.meta.get(DISPATCH_TIME)
+        if stamp is None:
+            self.missing_stamp += 1
+            if self.missing_stamp == 1:
+                logger.warning(
+                    "response with no dispatch_time: %s (further ones counted "
+                    "in stats as dispatch/missing_stamp)",
+                    response.url,
+                )
+            sent_field = "NA"
+        else:
+            sent_field = f"{float(stamp):.3f}"
         self.crawled_log.write(
-            f"{sent:.3f}",
+            sent_field,
             f"{recv:.3f}",
             response.url,
             response.status,
             ctype.split(";")[0],
             len(links),
+            len(body),
         )
         self.crawled_per_domain[key] += 1
         # The queued counter is released by the request_left_downloader

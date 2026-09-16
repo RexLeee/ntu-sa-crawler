@@ -1,243 +1,260 @@
-"""Stamp and enforce the real dispatch time of every request.
+"""Record the real dispatch time of every request, and refuse a short one.
 
+This module used to be the rate limiter. It is now the measurement point and
+a last-resort guard; crawler/downloader.py holds the limiter. The move is
+worth stating because the history explains three of the four politeness bugs
+this crawl has had.
+
+Why the timer moved out
+-----------------------
+The old design let this module claim a turn per request and honour it with
+`await asyncio.sleep(...)`. Two properties made that unsafe:
+
+  * A sleeping coroutine is not in slot.transferring, so Scrapy sees a free
+    transfer slot and pops the next request for that domain. Two coroutines
+    for one domain then slept at once.
+  * asyncio.sleep is a lower bound. Two sleeps overrun by different amounts,
+    so the one that claimed the LATER turn can wake first. A 20 minute run
+    dispatched two requests to poki.com 0.000520s apart exactly that way: one
+    had claimed turn 247.97 and the other 253.07, and the second went out
+    first at 254.160805, leaving the first to wake with its own turn six
+    seconds past and go straight out.
+
+Bounding the wait by the last real dispatch as well as by the claimed turn
+closed that particular hole, but the shape of the design was still "two
+independent timers that must agree". crawler/downloader.py instead makes the
+single timer Scrapy already has count from the previous response's
+completion, which no amount of reactor lateness can shorten. See its
+docstring for the proof.
+
+Where the measurement belongs
+-----------------------------
 Compliance is defined on request spacing as the server sees it, which is the
-moment the socket write happens. Two jobs live here, and both need the same
-hook.
+moment of the socket write. Three nearer-looking hooks are all wrong:
 
-Measuring
----------
-Three nearer-looking hooks are all wrong:
-
-  * Downloader middlewares run at enqueue time, because Downloader.fetch wraps
-    _enqueue_request in the middleware chain. Every queued request gets the
-    same timestamp.
+  * Downloader middlewares run at enqueue time, because Downloader.fetch
+    wraps _enqueue_request in the middleware chain. Every queued request gets
+    the same timestamp.
   * The request_reached_downloader signal fires from _enqueue_request, so it
     has the same problem.
   * meta['download_latency'] covers only the transfer, excluding DNS and
     TCP/TLS setup, so recv - latency lands late and understates the gap.
 
-Downloader._download is the first thing to run after the slot's delay timer
-releases a request, which makes it the correct measurement point.
+record_dispatch is called from Downloader._download, the first thing to run
+after the slot releases a request and the last before the handler opens the
+socket.
 
-Enforcing
+The guard
 ---------
-Scrapy's Slot._process_queue sets slot.lastseen to the moment it *schedules*
-the download coroutine, then calls _schedule_coro. The coroutine runs whenever
-the event loop reaches it. At high concurrency that is not immediate: a
-measured run saw the loop blocked for up to 1.4s at a time.
-
-When the first request of a pair is delayed by congestion and the second is
-not, the gap the server sees is shorter than the configured delay. A run at
-CONCURRENT_REQUESTS=3000 produced 50 such violations, the worst at 4.694s
-against a 5.0s limit. Raising DOWNLOAD_DELAY to 5.5s cut that to one at
-4.941s: the jitter is a long tail (p50 36ms, p99 302ms, max 559ms), so margin
-alone cannot close it.
-
-Re-checking the clock here does. This is the last point before the request
-reaches the network, so a gap measured from the previous request's real
-dispatch cannot be shortened by anything downstream.
-
-Both behaviours are verified by tests/test_dispatch.py.
+record_dispatch raises IgnoreRequest when a dispatch lands closer than the
+floor to the previous one on the same domain. Under the completion-anchored
+design this cannot happen, so the guard should never fire: it exists because
+"should never" has been wrong three times on this crawl, and losing one page
+is cheaper than one violation. dispatch/guard_refused is asserted to be 0 in
+the smoke acceptance list.
 """
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import os
 import time
 import traceback
+from pathlib import Path
 
-import scrapy.core.downloader as _dl
+from scrapy.exceptions import IgnoreRequest
 
 from crawler.slot import slot_key
 
+logger = logging.getLogger(__name__)
+
 DISPATCH_TIME = "dispatch_time"
 
-_installed = False
+# Configured once from BroadSpider.__init__.
+_min_gap = 0.0
+_dispatch_log = None
+_trace_fh = None
+_stats = None
+
+# When each domain last actually dispatched. This is the quantity
+# ops/verify_politeness.py measures, so the guard and the offline check cannot
+# disagree about what a gap is.
+#
+# Keyed by the domain the URL names, not by id(slot) and not by meta.
+#
+# Not id(slot): Downloader._slot_gc destroys any slot idle for 60s, and
+# CPython reuses the freed address almost immediately, measured at 1,999
+# recycles in 2,000 allocations. So id(slot) is neither stable for one domain
+# nor unique across domains. A two hour run produced exactly that failure
+# twice on panasonic.jp, both after quiet periods long enough for the slot to
+# be collected and rebuilt.
+#
+# Not meta: a request built from another request inherits its meta, so a
+# redirect or a meta refresh carries the source domain's key to a target on a
+# different domain. A 10 minute run produced six violations that way, every
+# one of them invisible because the timer believed it was looking at the
+# source domain's history.
+_last_out: dict[str, float] = {}
+_LAST_OUT_MAX = 100_000
+
+# (dispatched, url) of the previous dispatch per domain, for the trace only.
+_last_trace: dict[str, tuple[float, str]] = {}
+_LAST_TRACE_MAX = 200_000
 
 
 def _open_trace(path: str):
     """Open the diagnostic log, or return None if it cannot be written.
 
-    Diagnostics must never take the crawl down, so a failure here is silent
-    and simply disables tracing.
+    Diagnostics must never take the crawl down, so a failure here disables
+    tracing rather than raising. It is logged: an empty trace file is read as
+    evidence of compliance, and "never opened" must not look the same as
+    "opened and stayed empty".
     """
     try:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         return open(path, "a", buffering=1, encoding="utf-8")
-    except OSError:
+    except OSError as exc:
+        logger.warning("short-gap tracing disabled, cannot open %s: %s", path, exc)
         return None
 
 
-def install(min_gap: float = 0.0, trace_path: str | None = None) -> None:
-    """Stamp meta['dispatch_time'] and hold each slot to min_gap seconds.
+def configure(
+    min_gap: float = 0.0,
+    trace_path: str | None = None,
+    log_path: str | None = None,
+) -> None:
+    """Set the floor the guard enforces and open the two diagnostic files.
 
-    A min_gap of 0 only measures, which is what the dispatch timing test needs
-    when it exercises Scrapy's own delay.
+    A min_gap of 0 only measures, which is what a plain `scrapy crawl` gets.
+
+    When log_path is set, every dispatch is recorded there. This is the only
+    complete record of what the crawler sent: data/crawled.log.gz is written
+    from parse(), so it holds successful HTML fetches only and omits both
+    failed requests and every robots.txt fetch, even though all of them
+    consumed a real turn on the domain's timer. In one measured run 40,957 of
+    45,825 robots fetches timed out, so the majority of what the crawler sent
+    was invisible to the response-side log. ops/verify_politeness.py can read
+    either file, and the compliance claim rests on this one.
 
     When trace_path is set, every dispatch closer than min_gap to the previous
-    one on the same slot is dumped there with the state that produced it.
-
-    The trace earned its keep by staying empty. Six violations were reported
-    by the offline check while this recorded nothing, and those two facts
-    together are what identified the cause: the spacing was correct, but the
-    grouping was not, so a violation could not appear here. Now that both use
-    slot_key(url), a short gap written here is a real defect rather than a
-    disagreement about identity. The check is two dict operations per dispatch
-    and only writes when a gap is short, so it stays on for the full 48 hours.
+    one on the same domain is dumped there with the state that produced it,
+    and refused.
     """
-    global _installed
-    if _installed:
-        return
+    global _min_gap, _dispatch_log, _trace_fh
+    _min_gap = float(min_gap)
+    _last_out.clear()
+    _last_trace.clear()
 
-    original = _dl.Downloader._download
+    if trace_path:
+        _trace_fh = _open_trace(trace_path)
+    if log_path:
+        from crawler.logwriter import GzipLineWriter
 
-    # The earliest time each slot may dispatch again. Storing the *next*
-    # allowed time rather than the last dispatch is what makes this safe under
-    # concurrency: each coroutine claims its turn before awaiting, so two
-    # coroutines entering together get consecutive turns instead of reading
-    # the same "last dispatch" and waking at the same instant.
-    #
-    # Keyed by the domain the URL names, not by id(slot) and not by meta.
-    #
-    # Not id(slot): Downloader._slot_gc destroys any slot idle for 60s, and
-    # CPython reuses the freed address almost immediately, measured at 1,999
-    # recycles in 2,000 allocations. So id(slot) is neither stable for one
-    # domain nor unique across domains. A two hour run produced exactly that
-    # failure twice on panasonic.jp, both after quiet periods long enough for
-    # the slot to be collected and rebuilt.
-    #
-    # Not meta: a request built from another request inherits its meta, so a
-    # redirect or a meta refresh carries the source domain's key to a target
-    # on a different domain. A 10 minute run produced six violations that way,
-    # every one of them invisible here because the timer believed it was
-    # looking at the source domain's history.
-    #
-    # The domain string derived from the URL is stable across slot GC, unique
-    # between domains, and impossible to inherit. It is also exactly what
-    # ops/verify_politeness.py groups by, so the two cannot diverge.
-    next_allowed: dict[str, float] = {}
+        _dispatch_log = GzipLineWriter(Path(log_path))
 
-    # Diagnostics. last_dispatch records what actually went out per slot, which
-    # is what the compliance check measures; next_allowed records what was
-    # promised. A short gap means those two disagree, and the dump says how.
-    # Keyed by domain, so it grows with the domain count rather than the
-    # request count: a 48 hour run reaching 37,000 domains holds about 10 MB
-    # of URL strings here. Bounded anyway, since the trace is a diagnostic and
-    # must not be the thing that runs the crawl out of memory.
-    trace_fh = _open_trace(trace_path) if trace_path else None
-    last_dispatch: dict[str, tuple[float, str, float]] = {}
-    _LAST_DISPATCH_MAX = 200_000
 
-    def _trace_short_gap(downloader, slot, request, slot_id, claimed_turn, dispatched):
-        previous = last_dispatch.get(slot_id)
-        if previous is None and len(last_dispatch) >= _LAST_DISPATCH_MAX:
-            # Drop the whole history rather than pay to find the oldest entry.
-            # Losing it only means the next dispatch on each domain has nothing
-            # to compare against, so one gap goes unchecked per domain. The
-            # real compliance check reads crawled.log.gz and is unaffected.
-            last_dispatch.clear()
-        last_dispatch[slot_id] = (dispatched, request.url, claimed_turn)
-        if previous is None:
-            return
-        gap = dispatched - previous[0]
-        if gap >= min_gap - 0.05:
-            return
-        interesting = (
-            "download_slot",
-            "new_domain",
-            "seed",
-            "depth",
-            "redirect_urls",
-            "redirect_times",
-            "dont_obey_robotstxt",
-        )
-        meta = {k: v for k, v in request.meta.items() if k in interesting}
-        trace_fh.write(
-            f"=== SHORT GAP {gap:.6f}s slot={slot_id!r} min_gap={min_gap}\n"
-            f"  prev  dispatched={previous[0]:.6f} claimed_turn={previous[2]:.6f}"
-            f" url={previous[1]}\n"
-            f"  curr  dispatched={dispatched:.6f} claimed_turn={claimed_turn:.6f}"
-            f" url={request.url}\n"
-            f"  next_allowed[slot]={next_allowed.get(slot_id, float('nan')):.6f}"
-            f"  dict_size={len(next_allowed)}\n"
-            f"  slot obj={id(slot)} delay={getattr(slot, 'delay', '?')}"
-            f" concurrency={getattr(slot, 'concurrency', '?')}"
-            f" lastseen={getattr(slot, 'lastseen', '?')}\n"
-            f"  len(active)={len(getattr(slot, 'active', ()))}"
-            f" len(transferring)={len(getattr(slot, 'transferring', ()))}"
-            f" len(queue)={len(getattr(slot, 'queue', ()))}\n"
-            f"  slot_is_live={getattr(downloader, 'slots', {}).get(slot_id) is slot}\n"
-            f"  meta={meta}\n"
-            f"  stack:\n"
-        )
-        for frame in traceback.format_stack(limit=20):
-            trace_fh.write("    " + frame.rstrip().replace("\n", "\n    ") + "\n")
-        trace_fh.write("\n")
+def set_stats(stats) -> None:
+    """Attach the stats collector the guard reports refusals through.
 
-    async def _download_with_stamp(self, slot, request):
-        if min_gap > 0:
-            # Derived from the URL, never read from meta. meta is copied
-            # between requests by every component that builds one from
-            # another, so a target request can arrive carrying the source
-            # domain's key and be spaced against the wrong history. See
-            # crawler/downloader.py, which keys Scrapy's own slots the same
-            # way for the same reason.
-            slot_id = slot_key(request.url)
-            # Claim a turn before awaiting. Without this, coroutines released
-            # together all read the same previous time and wake at the same
-            # instant; a measured run left two of three gaps at 0.000s.
-            turn = max(time.time(), next_allowed.get(slot_id, 0.0))
-            next_allowed[slot_id] = turn + min_gap
+    Separate from configure() because Crawler.stats raises until the crawl
+    starts, while the floor and the log files must be set before the
+    Downloader is built. A refusal before this point is still logged and
+    traced; only the counter would miss it, and nothing can dispatch that
+    early anyway.
+    """
+    global _stats
+    _stats = stats
 
-            # asyncio.sleep guarantees a lower bound, not an exact wake time:
-            # the wake-up queues behind whatever the loop is already running.
-            # Sleeping once to the claimed turn therefore still lands late by
-            # a varying amount, and when the previous request landed later
-            # than this one the server sees them too close. Re-checking after
-            # each sleep converts that into a real elapsed-time guarantee.
-            while True:
-                remaining = turn - time.time()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
 
-            # Advance from the moment the request actually goes out, not from
-            # the moment it was scheduled to, so lateness never compounds into
-            # a short gap for the next one.
-            #
-            # max(), not a plain assignment. While this coroutine slept, a
-            # sibling on the same slot may have claimed a later turn and
-            # written it here. Overwriting that with dispatched + min_gap
-            # would hand the sibling's reserved turn to the next arrival, and
-            # the two would go out together. Only ever move the reservation
-            # forward.
-            dispatched = time.time()
-            next_allowed[slot_id] = max(
-                next_allowed.get(slot_id, 0.0), dispatched + min_gap
-            )
+def _trace(request, slot_id: str, dispatched: float, observed: float) -> None:
+    previous = _last_trace.get(slot_id)
+    _trace_fh.write(
+        f"=== SHORT GAP {observed:.6f}s slot={slot_id!r} floor={_min_gap}\n"
+        f"  prev  dispatched={previous[0]:.6f} url={previous[1]}\n"
+        f"  curr  dispatched={dispatched:.6f} url={request.url}\n"
+        f"  meta={ {k: v for k, v in request.meta.items() if k in _INTERESTING} }\n"
+        f"  stack:\n"
+    )
+    for frame in traceback.format_stack(limit=20):
+        _trace_fh.write("    " + frame.rstrip().replace("\n", "\n    ") + "\n")
+    _trace_fh.write("\n")
 
-            # Bound the dict. Entries whose gap has already elapsed can never
-            # constrain a future request, so dropping them is safe: the next
-            # request for that domain claims max(now, missing) == now, which
-            # is the same answer the entry would have given.
-            #
-            # This must NOT evict by "is the slot still live". A collected
-            # slot is exactly the case that caused the violation: the domain
-            # comes back, and its gap has to come back with it.
-            if len(next_allowed) > 100_000:
-                cutoff = dispatched
-                for key in [k for k, v in next_allowed.items() if v <= cutoff]:
-                    del next_allowed[key]
 
-            request.meta[DISPATCH_TIME] = dispatched
-            if trace_fh is not None:
-                _trace_short_gap(self, slot, request, slot_id, turn, dispatched)
-        else:
-            request.meta[DISPATCH_TIME] = time.time()
-        return await original(self, slot, request)
+_INTERESTING = (
+    "download_slot",
+    "new_domain",
+    "seed",
+    "depth",
+    "redirect_urls",
+    "redirect_times",
+    "dont_obey_robotstxt",
+)
 
-    _dl.Downloader._download = _download_with_stamp
-    _installed = True
+
+def record_dispatch(request) -> None:
+    """Stamp the request, log it, and refuse it if the gap is short.
+
+    Called from crawler/downloader.py at the top of _download. Raises
+    IgnoreRequest rather than returning a verdict, because the caller's next
+    statement opens a socket: there is no safe way to continue.
+    """
+    dispatched = time.time()
+    # Derived from the URL, never read from meta. See the _last_out comment.
+    slot_id = slot_key(request.url)
+
+    if _min_gap > 0:
+        previous = _last_out.get(slot_id)
+        if previous is not None:
+            observed = dispatched - previous
+            # 0.05s of slack, matching ops/verify_politeness.py, so the guard
+            # and the offline check agree on the verdict for every pair.
+            if observed < _min_gap - 0.05:
+                if _stats is not None:
+                    _stats.inc_value("dispatch/guard_refused")
+                if _trace_fh is not None:
+                    _trace(request, slot_id, dispatched, observed)
+                logger.warning(
+                    "politeness guard refused %s: %.6fs since the previous "
+                    "dispatch to %s, floor %.2fs",
+                    request.url, observed, slot_id, _min_gap,
+                )
+                raise IgnoreRequest("politeness guard: gap too short")
+
+        if _trace_fh is not None:
+            if slot_id not in _last_trace and len(_last_trace) >= _LAST_TRACE_MAX:
+                # Drop the whole history rather than pay to find the oldest
+                # entry. One gap then goes unchecked per domain, and the real
+                # compliance check reads the dispatch log and is unaffected.
+                _last_trace.clear()
+            _last_trace[slot_id] = (dispatched, request.url)
+
+        # Bound the dict. An entry whose gap has already elapsed can never
+        # refuse a future request, so dropping it is safe: a missing entry
+        # means the next dispatch is unconstrained, which is the same answer
+        # the entry would have given.
+        #
+        # This must NOT evict by "is the slot still live". A collected slot is
+        # exactly the case that caused an earlier violation: the domain comes
+        # back, and its history has to come back with it.
+        if len(_last_out) > _LAST_OUT_MAX:
+            stale = dispatched - _min_gap
+            for key in [k for k, v in _last_out.items() if v <= stale]:
+                del _last_out[key]
+        _last_out[slot_id] = dispatched
+
+    request.meta[DISPATCH_TIME] = dispatched
+    if _dispatch_log is not None:
+        _dispatch_log.write(f"{dispatched:.3f}", slot_id, request.url)
+
+
+def close_dispatch_log() -> None:
+    """Flush the dispatch record. Called from the spider's closed()."""
+    global _dispatch_log, _trace_fh
+    if _dispatch_log is not None:
+        _dispatch_log.close()
+        _dispatch_log = None
+    if _trace_fh is not None:
+        _trace_fh.close()
+        _trace_fh = None

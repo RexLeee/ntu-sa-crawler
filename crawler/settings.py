@@ -21,12 +21,22 @@ NEWSPIDER_MODULE = "crawler.spiders"
 ROBOTSTXT_OBEY = _pol["obey_robotstxt"]
 ROBOTSTXT_PARSER = "scrapy.robotstxt.ProtegoRobotParser"
 DOWNLOAD_DELAY = _pol["download_delay"]
+# 1 is load-bearing, not a throttle setting. It is what stops a second request
+# for a domain from being popped while the first is still transferring, which
+# is what makes the completion-anchored delay in crawler/downloader.py a
+# guarantee rather than a hope.
 CONCURRENT_REQUESTS_PER_DOMAIN = _pol["concurrent_requests_per_domain"]
-# Scrapy keys a download slot by meta['download_slot'], else by hostname.
-# Neither is the registered domain, and meta is inherited by any request built
-# from another one. This subclass derives the key from the URL instead, which
-# is the same definition ops/verify_politeness.py checks. See
-# crawler/downloader.py.
+# Two overrides, both about compliance:
+#
+# 1. Scrapy keys a download slot by meta['download_slot'], else by hostname.
+#    Neither is the registered domain, and meta is inherited by any request
+#    built from another one. The subclass derives the key from the URL, which
+#    is the same definition ops/verify_politeness.py checks.
+# 2. Scrapy spaces the POPS from the slot queue, not the requests. The
+#    subclass advances slot.lastseen at the response's completion instead, so
+#    DOWNLOAD_DELAY becomes a floor on the interval the server sees.
+#
+# See crawler/downloader.py.
 DOWNLOADER = "crawler.downloader.DomainSlotDownloader"
 # A meta refresh builds its target with source_request.replace(), which copies
 # meta wholesale and inherits dont_filter. That gave the target the source
@@ -36,8 +46,11 @@ DOWNLOADER = "crawler.downloader.DomainSlotDownloader"
 METAREFRESH_ENABLED = _crawl["follow_meta_refresh"]
 # Scrapy randomizes the delay to 0.5x-1.5x by default. At a 5s delay that
 # produces 2.5s gaps, which breaks the 0.2 qps limit. Must stay 0.
+#
+# RANDOMIZE_DOWNLOAD_DELAY is not set alongside it. Setting it at all makes
+# Downloader._default_jitter emit a deprecation warning in 2.19, and this
+# setting is the only one it reads when the deprecated name is left alone.
 DOWNLOAD_DELAY_JITTER = _pol["download_delay_jitter"]
-RANDOMIZE_DOWNLOAD_DELAY = False  # pre-2.13 name for the same behaviour
 
 # --- throughput -------------------------------------------------------------
 CONCURRENT_REQUESTS = _crawl["concurrent_requests"]
@@ -102,6 +115,7 @@ ROBOTS_CACHE_SIZE = _mem["robots_cache_size"]
 # crawler/middlewares/robots.py.
 ROBOTS_STRICT_ON_FAILURE = _mem["robots_strict_on_failure"]
 ROBOTS_FAILURE_TTL = _mem["robots_failure_ttl"]
+MAX_CRAWL_DELAY = _pol["max_crawl_delay"]
 
 # --- trimming ---------------------------------------------------------------
 COOKIES_ENABLED = _crawl["cookies_enabled"]
@@ -122,9 +136,22 @@ LOG_FORMATTER = "crawler.logformatter.QuietLogFormatter"
 # The external sampler sees RSS and file descriptors. It cannot see main-thread
 # CPU, reactor lag, the scraper queue or the per-domain queue count, which are
 # the numbers that decide whether this survives 48 hours.
-EXTENSIONS = {"crawler.extensions.runstats.RunStats": 500}
+EXTENSIONS = {
+    "crawler.extensions.runstats.RunStats": 500,
+    # CLOSESPIDER_TIMEOUT cannot end this crawl: its close waits for every
+    # request parked on a per-domain timer, which took over five minutes. This
+    # cancels the parked ones first. See crawler/extensions/shutdown.py.
+    "crawler.extensions.shutdown.TimedShutdown": 501,
+}
 RUNSTATS_INTERVAL = _crawl["runstats_interval"]
 RUNSTATS_OBJECTS_INTERVAL = _crawl["runstats_objects_interval"]
+# The cyclic collector walks 1.7M protego objects on every gen-2 pass, and it
+# does it on the reactor thread. See config.toml [memory].
+GC_THRESHOLD0 = _mem["gc_threshold0"]
+GC_FREEZE_AT_START = _mem["gc_freeze_at_start"]
+# Set per run by ops/run_hour.sh with -s RUN_DURATION=<seconds>. 0 disables it,
+# which is what a manual `scrapy crawl` gets.
+RUN_DURATION = 0
 
 DOWNLOADER_MIDDLEWARES = {
     "scrapy.downloadermiddlewares.robotstxt.RobotsTxtMiddleware": None,

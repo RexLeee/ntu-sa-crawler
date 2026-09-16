@@ -19,22 +19,64 @@ uv run scrapy crawl broad -s CLOSESPIDER_TIMEOUT=300
 ops/run_hour.sh 600
 
 # compliance proofs, across every shard's log
-uv run python ops/verify_politeness.py     # must print "VIOLATIONS : 0"
-uv run python ops/verify_robots.py         # must print "VIOLATIONS : 0"
+# Default source is data/dispatched*.log.gz: every request the crawler sent,
+# including robots.txt and the ones that failed.
+uv run python ops/verify_politeness.py                    # "VIOLATIONS : 0"
+uv run python ops/verify_politeness.py --source crawled   # "VIOLATIONS : 0"
+uv run python ops/verify_robots.py                        # "VIOLATIONS : 0"
 uv run python ops/verify_no_refetch.py     # ~1.4%, see the redirect note
 
 # measured metrics and projection
-uv run python ops/report_metrics.py
+uv run python ops/report_metrics.py --json data/run-<stamp>/metrics.json
+uv run python ops/report_timeline.py data/run-<stamp>
 
 # tests
-for t in dispatch handoff pqueue scheduler robots_cache dupefilter; do
+for t in dispatch downloader handoff pqueue scheduler robots_cache dupefilter shutdown; do
     uv run python tests/test_$t.py
 done
 ```
 
-`data/violation-trace*.log` must stay empty. The dispatch timer and
-`verify_politeness.py` group by the same key, so anything written there is a
-real short gap.
+`data/violation-trace*.log` must be 0 bytes. An entry means the guard in
+`crawler/dispatch.py` caught a dispatch closer than 5.0s to the previous one
+on that domain, and refused it. Under the design below that cannot happen, so
+an entry is a defect rather than a tuning problem. The refusal is also counted
+as `dispatch/guard_refused` in `data/stats*.json`, which the acceptance list
+requires to be 0 or absent.
+
+### Honouring Crawl-delay
+
+Scrapy's `RobotsTxtMiddleware` parses `Crawl-delay` but never applies it
+(scrapy/scrapy#892). `crawler/middlewares/robots.py` raises `slot.delay` to
+the requested value, capped at `max_crawl_delay = 60.0`. That is sufficient
+on its own now, because `slot.delay` is the single throttle and it counts from
+the previous response's completion.
+
+The 60 second cap is also what keeps slot collection safe.
+`Downloader._slot_gc` drops a slot after 60s idle, and a rebuilt slot's delay
+would be back at the global 5.1s. Since no delay in play exceeds 60s, a
+rebuilt slot's first request is already at least its own delay after the
+domain's last one.
+
+## Sitemaps are never fetched
+
+The assignment excludes URLs found inside sitemaps from both Tier 1 metrics.
+No such URL can enter this crawl's data, because the crawler has no code path
+that reaches one:
+
+- `sitemap.xml` is never requested. The only non-page fetch anywhere is
+  `robots.txt`, in `crawler/middlewares/robots.py`.
+- `robots.txt` bodies are handed to Protego for allow/deny rules and
+  `Crawl-delay` only. `Sitemap:` lines are never read.
+- Scrapy's `SitemapSpider` is not used; `BroadSpider` extends plain `Spider`.
+- Link discovery is a regex over `<a href>` in `crawler/extract.py`. The
+  `<urlset>` and `<loc>` elements a sitemap is made of are not matched, and
+  `.xml` is in `filters.skip_extensions`.
+
+`grep -rni sitemap crawler/` returns nothing, which is the check.
+
+An `<a href="/sitemap.xml">` link on an ordinary HTML page is followed like
+any other link, and the page it fetches counts as one crawled page. What never
+happens is parsing that file for the URLs inside it.
 
 All tunable values live in `config.toml`. No parameter is hardcoded in the
 Python sources.
@@ -68,23 +110,84 @@ count as separate domains. They are separate sites on shared infrastructure.
 
 Scrapy randomizes the delay to 0.5x–1.5x by default. At a 5 second setting
 that produces 2.5 second gaps, which breaks the limit. `DOWNLOAD_DELAY_JITTER`
-is pinned to 0, and the legacy `RANDOMIZE_DOWNLOAD_DELAY` is set to False.
+is pinned to 0. The legacy `RANDOMIZE_DOWNLOAD_DELAY` is deliberately not set
+at all: in Scrapy 2.19 setting it emits a deprecation warning, and
+`_default_jitter` reads the new name when the old one is left alone.
 
-### Crawl-delay is honored
+### The delay counts from the previous response's completion
 
-Scrapy's `RobotsTxtMiddleware` parses `Crawl-delay` but never applies it
-(scrapy/scrapy#892). `crawler/middlewares/robots.py` subclasses it to:
+This is the invariant everything else rests on, and it took four attempts to
+get right.
 
-1. Raise the slot delay when a site asks for more than 5 seconds, capped at 60.
-2. Bound the parser cache, which Scrapy never evicts from.
+Scrapy spaces the **pops** from a slot's queue, not the requests.
+`Downloader._process_queue` writes `slot.lastseen` at the moment it pops, then
+hands the download to the event loop, which runs it whenever it gets there. So
+`DOWNLOAD_DELAY` bounds the interval between two scheduling decisions and
+nothing bounds the interval between the two socket writes that follow.
 
-The `robots.txt` fetch shares the site's timer with no work at all, because the
-slot key comes from the URL and `robots.txt` is on the same registered domain
-as the pages it governs.
+On this crawl that gap is large. A 20 minute run held the reactor thread at
+95–98% CPU for its whole length, with a 0.5s timer firing 1.3–4.6 seconds late
+at the median and up to 9.7 seconds late at the maximum.
+
+Three earlier designs tried to close it and each failed in a way worth
+recording:
+
+| Attempt | Why it failed |
+|---|---|
+| Raise `DOWNLOAD_DELAY` to 5.5s for margin | Cut 50 violations to 1. The lateness is a long tail (p50 36ms, p99 302ms, max 559ms), so no fixed margin covers it. |
+| A second timer in `dispatch.py` that slept to a claimed turn | A sleeping coroutine is not in `slot.transferring`, so Scrapy saw a free transfer slot and popped the next request for that domain. Two coroutines then slept at once. |
+| Bound that sleep by the last real dispatch as well | Correct as far as it went, but it still relied on two independent timers agreeing, and it could not constrain the interval between the stamp and the socket write. |
+
+`crawler/downloader.py` overrides `_download` to advance `slot.lastseen` at the
+response's **completion** instead. Every step then points the same way:
+
+```
+pop(B)   >= complete(A) + delay      the override, via slot.lastseen
+stamp(B) >= pop(B)                   the stamp is taken in that coroutine
+wire(A)  <= complete(A)              a socket write precedes its response
+-------------------------------------------------------------------------
+wire(B)  >= wire(A) + delay
+```
+
+Reactor lateness appears only on the right-hand side of a `>=`, so it can only
+widen the gap. `CONCURRENT_REQUESTS_PER_DOMAIN = 1` is the other half: B
+cannot be popped while A is still transferring, so two requests for one domain
+are never in flight together and there is no ordering between them to get
+wrong.
+
+This is what Heritrix calls [`min-delay-ms`](https://github.com/internetarchive/heritrix3/wiki/Politeness-parameters),
+"a minimum delay from the last request completion", and what Nutch's
+`FetchItemQueue` implements by recording the time the last request finished.
+Both are reference implementations for a politeness-critical broad crawl.
+
+The cost is accepted: a domain yields one page per (delay + round trip) rather
+than one per delay, about 20% fewer pages from any single domain at a 1.5s
+median round trip. It costs no throughput overall, because the bottleneck is
+the reactor thread at 97% CPU rather than the supply of ready domains. The
+same run held 5,000–10,000 live domains, which at 5.1s allows 1,568 pages/s
+against the 28 per shard actually achieved.
+
+`slot.lastseen` lives on the `Slot`, and `_slot_gc` destroys any slot idle for
+60s, so a rebuilt slot would start with no history and dispatch immediately. A
+two hour run produced exactly that, two requests to `panasonic.jp` 0.001s
+apart. `DomainSlotDownloader` therefore also keeps the completion time in a
+dict keyed by registered domain, outside the slot, and seeds a newly built
+slot's `lastseen` from it. `tests/test_dispatch.py slot_gc` collects the slot
+between every request and fails without this.
+
+`tests/test_downloader.py` is what pins the semantics. It serves responses
+that take 1.5s against a 2.0s delay, so a pop-anchored delay produces 2.0s
+gaps and a completion-anchored one produces 3.5s. Measured: 3.514s, with
+completion-to-dispatch at exactly 2.000s. It runs the same assertion against a
+handler that fails, because a timeout must also cost the domain its delay.
+
+### The robots.txt fetch
+
+It shares the site's timer with no work at all, because the slot key comes
+from the URL and `robots.txt` is on the same registered domain as the pages it
+governs.
 
 ## Measuring compliance correctly
-
-This took three attempts and is the most subtle part of the project.
 
 `DOWNLOAD_DELAY` spaces apart the moments requests **start**, not the moments
 responses arrive. Three plausible measurement points are all wrong:
@@ -96,11 +199,14 @@ responses arrive. Three plausible measurement points are all wrong:
 | `recv - meta['download_latency']` | `download_latency` covers only the transfer, excluding DNS and TCP/TLS setup, so the derived start lands late. Produced a false violation at 4.675s. |
 
 The correct point is `Downloader._download`, the first thing to run after the
-slot's delay timer releases a request. `crawler/dispatch.py` stamps
-`meta['dispatch_time']` there.
+slot releases a request and the last before the handler opens a socket.
+`crawler/dispatch.py` stamps `meta['dispatch_time']` there, writes
+`data/dispatched*.log.gz`, and refuses anything under the floor.
 
 `tests/test_dispatch.py` locks this in against a local HTTP server: four
-requests on one slot with a 2 second delay must dispatch 2 seconds apart.
+requests on one slot with a 2 second delay must dispatch 2 seconds apart, the
+guard must stay silent, and the dispatch log must hold one line per request
+all grouped under one key.
 
 ## Measured results
 
@@ -476,21 +582,70 @@ violations to 1, because the jitter is a long tail:
 | p99 | 302 ms |
 | max | 559 ms |
 
-`crawler/dispatch.py` now enforces the floor at the last point before the
-request goes out. Two details make it correct:
-
-- **Claim the turn before awaiting.** Coroutines released together would
-  otherwise read the same previous timestamp and wake at the same instant. The
-  first attempt did exactly that and left two of three gaps at 0.000s.
-- **Re-check the clock after every sleep, and advance from the real dispatch
-  time.** `asyncio.sleep` guarantees a lower bound, not an exact wake time, so
-  a single sleep still lands late by a varying amount.
-
-Result: 0 violations over 26,801 requests, minimum gap 5.000s.
+The first fix enforced the floor inside `dispatch.py`, with each coroutine
+claiming a turn and sleeping to it. That reached 0 violations over 26,801
+requests on a single process, and it was still wrong. See the next section.
 
 The general lesson is that a rate limit expressed as a scheduling delay is not
-a rate limit. It becomes one only when enforced against the clock at the point
-the request leaves.
+a rate limit. It becomes one only when it is anchored to an event the
+scheduler cannot be late for.
+
+### The two short gaps that finished the argument
+
+A 20 minute run at `shards = 2` produced **2 violations in 191,882
+dispatches**: `poki.com` at 0.000520s and `wordpress.com` at 3.791s. Both were
+inside a single process, confirmed by grepping each domain in both dispatch
+logs and by `handoff/foreign_dropped = 0`.
+
+`data/violation-trace-0.log` named the cause in two numbers:
+
+```
+=== SHORT GAP 0.000520s slot='poki.com' applicable_floor=5.0
+  prev  dispatched=1789530254.160805 claimed_turn=1789530254.160802
+  curr  dispatched=1789530254.161325 claimed_turn=1789530247.970933
+```
+
+`curr` claimed a turn **6.19 seconds earlier** than `prev`, and dispatched
+second. The mechanism:
+
+1. Coroutine A claims turn T, B claims T+5. The reservation order is correct.
+2. Each sleeps to its own turn. `asyncio.sleep` is a lower bound only, and two
+   sleeps overrun by different amounts.
+3. A's sleep overran by ~6s, so B woke first and dispatched at `254.160805`.
+4. A then woke to find its own turn six seconds in the past, so its
+   `remaining <= 0` check passed and it dispatched at `254.161325`.
+
+Claiming turns in order does not make them dispatch in order. A second dict
+holding the last *real* dispatch closed that specific hole, and it also
+explains the earlier unexplained 2.604s gap, whose "reactor stall" account
+could not shorten a stamp-to-stamp gap at all.
+
+But the shape of the design was still two independent timers that had to
+agree, and a sleeping coroutine still left `slot.transferring` empty so Scrapy
+kept popping. The throttle was moved into `crawler/downloader.py` instead, and
+`dispatch.py` kept only the measurement and a guard. See "The delay counts
+from the previous response's completion" above.
+
+### Why the evidence had to change first
+
+None of this was visible at the time. `dispatched.log.gz` covered 191,882
+requests; `crawled.log.gz` covered 70,484. The old compliance claim was
+computed on a log missing **63%** of what the crawler actually sent, because
+`crawled.log.gz` is written in `parse()` and so omits every failed request and
+every robots.txt fetch. In one run 40,957 of 45,825 robots fetches timed out.
+One of the two violations was invisible to that log, and `--source crawled`
+still reports 0 on the same run.
+
+Two changes made the evidence complete:
+
+1. **`data/dispatched*.log.gz` records every dispatch**, robots.txt and
+   failures included. `verify_politeness.py --source dispatched` is the
+   default and the claim rests on it.
+2. **The silent fallback is gone.** `parse()` used to write the receive time
+   when a response carried no dispatch stamp. The receive time is always later
+   than the real dispatch, so it always widens the measured gap: the one case
+   that could hide a violation was the one case the fallback covered. A
+   missing stamp now writes `NA`, and the verifier counts those and fails.
 
 ## Sharding: more cores without shared state
 
@@ -608,14 +763,19 @@ owning a quarter of the domains spends it stacking requests on the few it
 holds. Raising it to 12,000 recovered 45.66 to 52.29, which is the sharding
 overhead being paid back, not a gain.
 
-**Sharding is kept anyway**, for one reason: it is compliant, verified at 0
-violations across four processes, and it is the only structure that can use
-more bandwidth if the link ever stops being the limit. It is not switched on
-by default. `sharding.shards = 1` runs the single process that is currently
-faster.
+**Sharding is now switched on, `sharding.shards = 2`.** The conclusion above
+was drawn on the WSL host, whose Wi-Fi link the crawl had already filled to
+72%: four processes were contending for a link that was already full. On
+t2d-standard-2 the link is not the constraint, 12.0 Mbps of 1,570 available,
+and two shards measured 53.09 pages/s against 25.51 for one process.
 
-The honest summary is that the 48 hour figure is bounded by the network, and
-no amount of local parallelism changes it.
+Compliance is structural rather than coordinated. A domain belongs to exactly
+one shard, chosen by `shard_of`, so its 5 second timer never spans processes
+and needs no shared state. `_drain_handoff` re-verifies ownership on every URL
+it receives rather than trusting the sending shard, because a handoff inbox
+left over from a run with a different shard count would otherwise redirect
+work to the wrong process. See the short-gap note above for the residual risk
+and the smoke run that tests for it.
 
 ## Seed selection
 

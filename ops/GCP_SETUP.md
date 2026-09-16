@@ -256,12 +256,22 @@ uv run python ops/verify_politeness.py                      # VIOLATIONS : 0
 uv run python ops/verify_politeness.py --source crawled     # VIOLATIONS : 0
 uv run python ops/verify_robots.py --hosts 100              # VIOLATIONS : 0
 wc -c data/violation-trace-*.log                            # 0 bytes each
-grep -c "Dumping Scrapy stats" data/run-*/scrapy-*.log      # 1 per shard
+grep -ho 'guard_refused": [0-9]*' data/stats-*.json         # absent, or 0
+grep -ho 'finish_reason": "[^"]*"' data/stats-*.json        # run_duration
 ls state/job-*/requests.bloom                               # one per shard
-ls -la data/stats-*.json                                    # one per shard
 cat data/run-*/supervisor.log                               # empty
 tail -3 data/run-*/resources.tsv                            # rss per shard, disk free
 ```
+
+`dispatch/guard_refused` and the trace are the same signal. The guard in
+`crawler/dispatch.py` refuses any dispatch under 5.0s from the previous one on
+that domain, and the throttle in `crawler/downloader.py` counts from the
+previous response's completion, so the guard cannot fire by design. An entry
+in either place is a defect to investigate before the 48 hour run starts.
+
+Do not grep for "Dumping Scrapy stats". That line is INFO and `log_level` is
+WARNING, so it never appears however cleanly the crawl closed. `finish_reason`
+in `data/stats-N.json` is the real marker.
 
 The default `--source dispatched` is the one that matters. It reads
 `data/dispatched*.log.gz`, which holds every request the crawler sent,

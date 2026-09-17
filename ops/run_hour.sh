@@ -80,6 +80,10 @@ MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-8000}"
 # A shard that dies is restarted on the same JOBDIR, so it resumes its frontier
 # and its Bloom filter. The cap stops a crash loop from running all night.
 MAX_RESTARTS="${MAX_RESTARTS:-10}"
+# A round lasting this long clears the restart count, so MAX_RESTARTS bounds a
+# crash loop rather than the whole run. 1800s is well above the sub-120s
+# window that marks a broken jobdir and far below any healthy round.
+RESTART_BUDGET_RESET_S="${RESTART_BUDGET_RESET_S:-1800}"
 # RESUME=1 keeps the previous run's frontier and logs. For restarting a crawl
 # whose supervisor died, not for a fresh measurement.
 RESUME="${RESUME:-0}"
@@ -232,6 +236,18 @@ run_shard() {
 
         ran=$(( $(date +%s) - started ))
         if [ "$SHARDS" -gt 1 ]; then sfx="-${i}"; else sfx=""; fi
+
+        # MAX_RESTARTS is a circuit breaker for a crash LOOP, not a budget for
+        # the whole run. restarts never reset, so a 48 hour run was capped by a
+        # figure sized for a 2 hour one: at 10 restarts that is one allowed
+        # failure every 4.8 hours. A round that ran this long proves the shard
+        # is healthy again, so the earlier failures stop counting against it.
+        if [ "$ran" -ge "$RESTART_BUDGET_RESET_S" ] && [ "$restarts" -gt 0 ]; then
+            echo "$(date -Iseconds) shard=$i ran ${ran}s, resetting restart count from $restarts" \
+                >> "$SUPERVISOR_LOG"
+            restarts=0
+            fast_crashes=0
+        fi
 
         # rc=0 is not the same as "the run is done", and it is not the same as
         # "restart it" either. Three outcomes, distinguished by finish_reason:
@@ -409,16 +425,18 @@ disk_free_mb() {
             echo "sampler deadline reached (${DEADLINE}s)" >&2
             break
         fi
-        # Stop the whole run only when a shard exhausted its restarts. A
-        # supervisor exiting is no longer proof of that: it also exits when
-        # its shard closes itself for a reason that must not be restarted,
-        # such as `finished`. Killing the run then would throw away the other
-        # shard's remaining hours for no reason, and the report is built from
-        # the logs, so a run that finishes with one shard is still reportable.
-        if ls "$RUNDIR"/shard-*.gaveup >/dev/null 2>&1; then
-            echo "$(date -Iseconds) a shard exhausted its restarts, stopping the run" \
+        # Stop the whole run only when EVERY shard has exhausted its restarts.
+        # A supervisor exiting is no proof of that: it also exits when its
+        # shard closes itself for a reason that must not be restarted, such as
+        # `finished`. And one shard giving up is no reason to kill the others,
+        # which is what this used to do despite the comment saying otherwise:
+        # it threw away the healthy shard's remaining hours. The report is
+        # built from the logs, so a run that ends with one shard is reportable.
+        GAVEUP=$(ls "$RUNDIR"/shard-*.gaveup 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${GAVEUP:-0}" -ge "$SHARDS" ]; then
+            echo "$(date -Iseconds) all $SHARDS shard(s) exhausted their restarts, stopping the run" \
                 >> "$SUPERVISOR_LOG"
-            echo "a shard exhausted its restarts; see $SUPERVISOR_LOG" >&2
+            echo "all shards exhausted their restarts; see $SUPERVISOR_LOG" >&2
             break
         fi
         if ! any_alive; then

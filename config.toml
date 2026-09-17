@@ -520,7 +520,55 @@ robots_strict_on_failure = true
 # How long an unreadable robots.txt stays unreadable before we try again.
 # Without this, one timeout during a traffic spike would silence a host for
 # the rest of the 48 hours.
+#
+# This is the FIRST wait. Each further consecutive failure for the same host
+# doubles it, up to robots_failure_ttl_max, because a flat TTL means a
+# permanently dead host is re-asked for the whole run: at 300s that is 24
+# retries in 2 hours but 576 in 48, and each one spends a dispatch and that
+# domain's 5 second slot. A measured 2 hour run spent 49.7% of all dispatches
+# on robots.txt and 50.2% of those failed.
 robots_failure_ttl = 300.0
+# 4 hours. Reached after 5 consecutive failures (300s doubling: 300, 600,
+# 1200, 2400, 4800 -> capped). A host is never written off for good: even at
+# the cap a 48 hour run re-checks it 12 times, so a site that comes back up
+# is picked up within one cap window.
+robots_failure_ttl_max = 14400.0
+# Bound for the two per-domain structures in crawler/spiders/broad.py that are
+# keyed by every domain ever seen. Measured 198 bytes per domain across the
+# two; the 48 hour domain count projects to 4.6M (curve fit) or 8.2M (linear),
+# which is 875-1,546 MB per shard against 931 MB of headroom under the guard.
+#
+# 300,000 costs 59 MB and is below the 343,644 domains a 2 hour run already
+# reached, which is deliberate. The cache only has to hold the domains still
+# being worked on, and PQUEUE_MAX pins that at 40,000. Evicting a colder entry
+# costs one extra new_domain exemption or one reset page count, both harmless.
+seen_domains_max = 300_000
+# How many ticks one frontier checkpoint pass is spread over.
+#
+# A single pass over 40,000 queues blocked the reactor for 24.9s (shard 0) and
+# 27.2s (shard 1), measured as checkpoint/frontier_ms. The reactor lag samples
+# at those moments show 27.8-36.4s stalls while gc_max_ms was only 82-215 ms,
+# so the cost is the synchronous writes, not the collector.
+#
+# That is longer than download_timeout (10s), so every socket whose timer
+# expires inside the stall fails spuriously on resume. At 20 slices each tick
+# saves 2,000 queues, about 1.3s, and a full pass still completes once per
+# checkpoint_interval.
+checkpoint_slices = 20
+# Seconds to delay the first Bloom filter save, so it does not land on the
+# same tick as a frontier slice. Half an interval keeps the two apart for the
+# whole run, since both then repeat on the same period.
+bloom_checkpoint_offset = 450.0
+# Ceiling for the new_domain exemption, as a multiple of frontier_max_size.
+#
+# A new domain's first URL is exempt from the frontier cap, because throughput
+# is active_domains / delay and domain growth is the curve that sets it. The
+# spider decides "new" from process memory, so a restart, or an eviction from
+# its bounded domain cache, lets domains already in the frontier claim the
+# exemption again. A measured 2 hour run overshot by 339 requests of 3,000,000
+# (0.011%) but never restarted. 1.1 caps the damage at 300,000 requests, about
+# 240 MB of jobdir, while leaving 100x the observed headroom.
+frontier_exempt_slack = 1.1
 
 [paths]
 data_dir = "data"

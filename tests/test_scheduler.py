@@ -131,6 +131,59 @@ def test_new_domain_bypasses_cap() -> bool:
     return True
 
 
+def test_the_exemption_has_a_ceiling() -> bool:
+    """The new_domain exemption must not push the frontier up without limit.
+
+    The spider decides new_domain from process memory, so a restart, or an
+    eviction from its bounded domain cache, lets domains already queued claim
+    the exemption again. Without a ceiling that is unbounded growth above the
+    cap; the cap is the whole point of the class.
+    """
+    cap = 10
+    sched = _scheduler(cap=cap)
+    # slack defaults to 1.1, so the ceiling is 11.
+    if sched._exempt_cap != int(cap * 1.1):
+        print(f"FAIL: exempt ceiling is {sched._exempt_cap}, expected {int(cap * 1.1)}")
+        return False
+
+    for i in range(cap):
+        sched.enqueue_request(
+            Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"})
+        )
+
+    # Every one of these claims the exemption. Past the ceiling they must stop
+    # being admitted, however new they claim to be.
+    admitted = 0
+    for i in range(50):
+        if sched.enqueue_request(
+            Request(
+                f"https://new{i}.example/",
+                meta={"download_slot": f"new{i}", "new_domain": True},
+            )
+        ):
+            admitted += 1
+
+    if sched._size > sched._exempt_cap:
+        print(f"FAIL: frontier reached {sched._size}, above the ceiling {sched._exempt_cap}")
+        return False
+    if admitted != sched._exempt_cap - cap:
+        print(f"FAIL: admitted {admitted} exempt requests, expected {sched._exempt_cap - cap}")
+        return False
+    if sched._size != len(sched):
+        print(f"FAIL: size tracking broke: {sched._size} != {len(sched)}")
+        return False
+    refused = sched.stats.get_value("scheduler/dropped/over_exempt_cap", 0)
+    if not refused:
+        print("FAIL: hitting the exemption ceiling was not counted")
+        return False
+
+    print(
+        f"PASS: the exemption stopped at {sched._size} of a {sched._exempt_cap} "
+        f"ceiling, {refused} refused"
+    )
+    return True
+
+
 def test_has_pending_requests_is_o1() -> bool:
     """has_pending_requests must not sum over every per-domain queue."""
     sched = _scheduler(cap=10_000_000)
@@ -378,6 +431,61 @@ def test_checkpoint_writes_every_queue() -> bool:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sliced_checkpoint_covers_every_queue() -> bool:
+    """Slices must together cover every queue, and each must be a real slice.
+
+    A whole-frontier pass at 40,000 queues blocked the reactor for 25s against
+    a 10s DOWNLOAD_TIMEOUT, so the periodic save is spread over several ticks.
+    If the slices did not reconverge on full coverage, a killed shard would
+    rescan from a much older position than one interval.
+    """
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    try:
+        jobdir = str(Path(tmp, "job"))
+        slices = 4
+        sched = _disk_scheduler(jobdir)
+        sched._slices = slices
+        for i in range(12):
+            sched.enqueue_request(
+                Request(f"https://d{i}.example/", meta={"download_slot": f"d{i}"})
+            )
+
+        queue_dir = Path(jobdir, "requests.queue")
+        # One slice must NOT write everything, or it is not slicing.
+        sched._checkpoint_slice()
+        after_one = len(list(queue_dir.glob("*/*/info.json")))
+        if after_one == 0 or after_one >= 12:
+            print(f"FAIL: one slice wrote {after_one} of 12 queues, expected a subset")
+            return False
+
+        # The remaining slices must finish the pass.
+        for _ in range(slices - 1):
+            sched._checkpoint_slice()
+        infos = list(queue_dir.glob("*/*/info.json"))
+        if len(infos) != 12:
+            print(f"FAIL: {len(infos)} of 12 queues saved after a full pass")
+            return False
+
+        saved = sched.stats.get_value("checkpoint/frontier_queues", 0)
+        if saved < 12:
+            print(f"FAIL: stats counted {saved} saves, expected at least 12")
+            return False
+        if sched.stats.get_value("checkpoint/frontier_slice_ms", 0) is None:
+            print("FAIL: the per-slice duration was not recorded")
+            return False
+
+        print(
+            f"PASS: {slices} slices covered all 12 queues, first slice wrote "
+            f"{after_one}"
+        )
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_slot_names_round_trip() -> bool:
     """Directory names must invert to slots, or a domain gets two queues."""
     from scrapy.pqueues import _path_safe
@@ -430,12 +538,14 @@ def main() -> int:
         test_size_matches_real_length(),
         test_cap_is_enforced(),
         test_new_domain_bypasses_cap(),
+        test_the_exemption_has_a_ceiling(),
         test_has_pending_requests_is_o1(),
         test_enqueue_cost_is_flat(),
         test_slot_names_round_trip(),
         test_a_killed_frontier_is_reloaded(),
         test_the_queue_cap_bounds_domains(),
         test_checkpoint_writes_every_queue(),
+        test_sliced_checkpoint_covers_every_queue(),
     ]
     return 0 if all(results) else 1
 

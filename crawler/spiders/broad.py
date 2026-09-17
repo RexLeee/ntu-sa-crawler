@@ -12,6 +12,7 @@ from collections import defaultdict
 
 from scrapy import Request, Spider, signals
 from scrapy.exceptions import CloseSpider
+from scrapy.utils.datatypes import LocalCache
 
 from crawler.config import PROJECT_ROOT, data_dir, load_config, state_dir
 from crawler.dispatch import DISPATCH_TIME, close_dispatch_log
@@ -101,10 +102,30 @@ class BroadSpider(Spider):
         seeds_path = seeds or self.cfg["seeds"]["seeds_file"]
         self.seeds_path = (PROJECT_ROOT / seeds_path).resolve()
 
-        # Per-domain bookkeeping. Bounded by the number of domains we touch.
-        self.crawled_per_domain: dict[str, int] = defaultdict(int)
+        # Per-domain bookkeeping. Two of these are keyed by every domain ever
+        # touched, and that count has no ceiling: a 2 hour run reached 343,644
+        # domains per shard and the arrival rate was still 14.7/s at the end.
+        # Fitting the curve gives 4.6M domains at 48 hours (t^0.796, R2 0.987)
+        # and 8.2M on a linear read. At a measured 198 bytes per domain across
+        # the two, that is 875-1,546 MB per shard against 931 MB of headroom
+        # under the 2,800 MB guard, so both are bounded here.
+        #
+        # Evicting is safe for both. crawled_per_domain losing an entry resets
+        # that domain's page count, which can only re-allow crawling a domain
+        # that had been capped -- it never blocks one. seen_domains losing an
+        # entry re-grants one new_domain exemption, worth a single request.
+        #
+        # queued_per_domain is NOT bounded here and must not be: _release_queued
+        # pops each key when its count reaches zero, so it already tracks live
+        # domains only, and its size follows PQUEUE_MAX rather than the run.
+        # Capping it would drop counts for domains still holding frontier slots.
+        domain_cap = self.cfg["memory"]["seen_domains_max"]
+        self.crawled_per_domain: LocalCache = LocalCache(limit=domain_cap)
         self.queued_per_domain: dict[str, int] = defaultdict(int)
-        self.seen_domains: set[str] = set()
+        self.seen_domains: LocalCache = LocalCache(limit=domain_cap)
+        # len(seen_domains) stops being the domain total once it evicts, and
+        # domains/seen is a reported metric, so count separately.
+        self.domains_seen_total = 0
 
         d = data_dir()
         self.crawled_log = GzipLineWriter(d / f"crawled{suffix}.log.gz")
@@ -253,7 +274,7 @@ class BroadSpider(Spider):
         stats.set_value("discovered/raw", self.discovered_raw)
         stats.set_value("discovered/unique", self.discovered_log.count)
         stats.set_value("dupefilter/skipped_before_request", self.dupe_skipped)
-        stats.set_value("domains/seen", len(self.seen_domains))
+        stats.set_value("domains/seen", self.domains_seen_total)
         stats.set_value("handoff/sent", self.handoff.sent)
         stats.set_value("handoff/received", self.handoff.received)
         stats.set_value("handoff/foreign_dropped", self.handoff_foreign)
@@ -303,7 +324,9 @@ class BroadSpider(Spider):
             # owner finds its own seeds without being told.
             if self.shards > 1 and shard_of(key, self.shards) != self.shard:
                 continue
-            self.seen_domains.add(key)
+            if key not in self.seen_domains:
+                self.domains_seen_total += 1
+            self.seen_domains[key] = True
             count += 1
             yield Request(
                 url, callback=self.parse, meta={"seed": True}, dont_filter=False
@@ -320,7 +343,7 @@ class BroadSpider(Spider):
             reason,
             self.crawled_log.count,
             self.discovered_log.count,
-            len(self.seen_domains),
+            self.domains_seen_total,
             self.handoff.sent,
             self.handoff.received,
         )
@@ -365,7 +388,8 @@ class BroadSpider(Spider):
             len(links),
             len(body),
         )
-        self.crawled_per_domain[key] += 1
+        # LocalCache has no defaultdict behaviour, so read-then-write.
+        self.crawled_per_domain[key] = self.crawled_per_domain.get(key, 0) + 1
         # The queued counter is released by the request_left_downloader
         # signal, which fires for failures too. Doing it here as well would
         # double-count.
@@ -457,7 +481,8 @@ class BroadSpider(Spider):
 
         is_new_domain = key not in self.seen_domains
         if is_new_domain:
-            self.seen_domains.add(key)
+            self.seen_domains[key] = True
+            self.domains_seen_total += 1
 
         self.queued_per_domain[key] += 1
         # No download_slot. crawler/downloader.py derives it from the URL, so

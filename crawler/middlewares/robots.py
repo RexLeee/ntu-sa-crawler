@@ -72,11 +72,24 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         # A failed fetch must not be cached forever, or one timeout during a
         # traffic spike would silence a host for the rest of the run. These
         # entries expire and the next request re-fetches.
+        #
+        # The wait doubles per consecutive failure up to _failure_ttl_max. A
+        # flat TTL re-asks a permanently dead host for the whole run: at 300s
+        # that is 24 retries in 2 hours but 576 in 48, each spending a dispatch
+        # and that domain's 5 second slot. A measured 2 hour run spent 49.7% of
+        # all dispatches on robots.txt and 50.2% of those failed, so the
+        # retries are the larger half of the largest single cost in the crawl.
         self._failure_ttl: float = crawler.settings.getfloat("ROBOTS_FAILURE_TTL", 300.0)
+        self._failure_ttl_max: float = crawler.settings.getfloat(
+            "ROBOTS_FAILURE_TTL_MAX", 14400.0
+        )
         # Bounded for the same reason as _parsers: keyed by host, it would
         # otherwise grow for the whole 48 hours. Losing an entry only means
         # the failure is treated as fresh, which re-fetches a little later
         # than it had to. It never grants access.
+        #
+        # Values are (monotonic_stamp, consecutive_failures) so the backoff
+        # above can grow the wait per host.
         self._failed_at = LocalCache(limit=cache_size)
 
         # Fetches currently running. Unbounded on purpose, but its size is the
@@ -92,6 +105,19 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         crawler.signals.connect(self._on_robots_parsed, signal=signals.robots_parsed)
         # The runstats extension reports cache occupancy and in-flight count.
         crawler.robots_middleware = self
+
+    def _ttl_for(self, failures: int) -> float:
+        """Exponential backoff: ttl * 2^(failures-1), capped.
+
+        failures is 1 for the first failure, so the first wait is the
+        configured ttl and each further consecutive failure doubles it.
+        """
+        if failures <= 1:
+            return self._failure_ttl
+        # Cap the shift before computing it: 2**576 is a real cost and the
+        # result is clamped anyway.
+        shift = min(failures - 1, 32)
+        return min(self._failure_ttl * (2**shift), self._failure_ttl_max)
 
     async def robot_parser(self, request: Request):
         """Fetch and cache robots.txt, keeping the fetch on our domain slot.
@@ -117,10 +143,15 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
             # when we first asked, and holding the failure would keep the
             # whole domain uncrawlable for the rest of the run.
             if parser is None:
-                failed_at = self._failed_at.get(netloc)
-                if failed_at is not None and time.monotonic() - failed_at >= self._failure_ttl:
+                entry = self._failed_at.get(netloc)
+                if entry is not None and time.monotonic() - entry[0] >= self._ttl_for(
+                    entry[1]
+                ):
+                    # Drop the cached failure but KEEP the failure count, so a
+                    # host that fails again waits longer rather than resetting
+                    # to the first interval. _parse_robots clears the count on
+                    # success.
                     self._parsers.pop(netloc, None)
-                    self._failed_at.pop(netloc, None)
                 else:
                     return None
             else:
@@ -193,7 +224,9 @@ class PoliteRobotsTxtMiddleware(RobotsTxtMiddleware):
         if not isinstance(exc, IgnoreRequest):
             self._stats.inc_value(f"robotstxt/exception_count/{type(exc)}")
         self._parsers[netloc] = None
-        self._failed_at[netloc] = time.monotonic()
+        prev = self._failed_at.get(netloc)
+        failures = (prev[1] + 1) if prev else 1
+        self._failed_at[netloc] = (time.monotonic(), failures)
         rp_dfd = self._inflight.get(netloc)
         if rp_dfd is not None:
             rp_dfd.callback(None)

@@ -57,6 +57,7 @@ class BloomDupeFilter(BaseDupeFilter):
         error_rate: float = 1e-4,
         debug: bool = False,
         checkpoint_interval: float = 0.0,
+        checkpoint_offset: float = 0.0,
         *,
         fingerprinter=None,
     ):
@@ -65,7 +66,11 @@ class BloomDupeFilter(BaseDupeFilter):
         self.logdupes = True
         self._path = Path(path, "requests.bloom") if path else None
         self._checkpoint_interval = float(checkpoint_interval)
+        self._checkpoint_offset = float(checkpoint_offset)
         self._checkpoint_loop = None
+        # close() may run before the deferred start fires, and a loop started
+        # after that would never be stopped.
+        self._closed = False
 
         if self._path and self._path.exists():
             self.bloom = Bloom.load(str(self._path), _hash128)
@@ -84,6 +89,7 @@ class BloomDupeFilter(BaseDupeFilter):
             error_rate=settings.getfloat("BLOOM_DUPEFILTER_ERROR_RATE", 1e-4),
             debug=settings.getbool("DUPEFILTER_DEBUG"),
             checkpoint_interval=settings.getfloat("CHECKPOINT_INTERVAL", 0.0),
+            checkpoint_offset=settings.getfloat("BLOOM_CHECKPOINT_OFFSET", 0.0),
             fingerprinter=crawler.request_fingerprinter,
         )
         # The spider checks URLs against this filter before it builds a
@@ -95,8 +101,23 @@ class BloomDupeFilter(BaseDupeFilter):
         """Start the periodic save. Called by the scheduler at spider open."""
         if self._path is None or self._checkpoint_interval <= 0:
             return
+        if self._checkpoint_offset > 0:
+            # The frontier saver in crawler/scheduler.py runs on the same
+            # thread and the same interval, so without an offset both land on
+            # the same tick and their stalls add. Delay the first save by the
+            # offset; both then repeat on the same period and stay apart.
+            from twisted.internet import reactor
+
+            reactor.callLater(self._checkpoint_offset, self._start_loop)
+            return
+        self._start_loop()
+
+    def _start_loop(self) -> None:
         from scrapy.utils.asyncio import create_looping_call
 
+        # callLater may fire after the crawl has already closed.
+        if self._path is None or self._closed:
+            return
         self._checkpoint_loop = create_looping_call(self.checkpoint)
         self._checkpoint_loop.start(self._checkpoint_interval, now=False)
 
@@ -180,6 +201,7 @@ class BloomDupeFilter(BaseDupeFilter):
         # A clean shutdown saves here. An unclean one keeps whatever the last
         # checkpoint wrote, which bounds the loss to one interval instead of
         # the whole run.
+        self._closed = True
         if self._checkpoint_loop is not None:
             if getattr(self._checkpoint_loop, "running", False):
                 self._checkpoint_loop.stop()

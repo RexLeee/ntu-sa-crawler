@@ -247,6 +247,48 @@ def test_failure_expires() -> bool:
     return True
 
 
+def test_failure_backoff_grows() -> bool:
+    """Each consecutive failure must wait longer, and the wait must be capped.
+
+    A flat TTL re-asks a permanently dead host for the whole run: 24 retries
+    in 2 hours but 576 in 48, each spending a dispatch and the domain's 5
+    second slot.
+    """
+    mw, _ = _failing_middleware(
+        ROBOTS_FAILURE_TTL=300.0, ROBOTS_FAILURE_TTL_MAX=14400.0
+    )
+    expected = [300.0, 600.0, 1200.0, 2400.0, 4800.0, 9600.0, 14400.0, 14400.0]
+    for failures, want in enumerate(expected, start=1):
+        got = mw._ttl_for(failures)
+        if got != want:
+            print(f"FAIL: {failures} failures gave ttl {got}, expected {want}")
+            return False
+
+    # A huge failure count must not compute 2**n before clamping.
+    if mw._ttl_for(10_000) != 14400.0:
+        print("FAIL: a large failure count did not clamp to the max")
+        return False
+
+    # The first failure must behave exactly as before this change, or the
+    # existing TTL semantics regress.
+    if mw._ttl_for(1) != 300.0 or mw._ttl_for(0) != 300.0:
+        print("FAIL: the first failure no longer uses the configured ttl")
+        return False
+
+    # And the count must actually advance across real failures.
+    async def run():
+        await mw.robot_parser(Request("https://dead.example/a"))
+
+    asyncio.get_event_loop().run_until_complete(run())
+    entry = mw._failed_at.get("dead.example")
+    if not entry or entry[1] != 1:
+        print(f"FAIL: first failure recorded {entry}, expected a count of 1")
+        return False
+
+    print("PASS: the failure wait doubles per attempt and clamps at the max")
+    return True
+
+
 def main() -> int:
     results = [
         test_eviction_refetches(),
@@ -256,6 +298,7 @@ def main() -> int:
         test_rules_are_actually_applied(),
         test_unreadable_robots_refuses(),
         test_failure_expires(),
+        test_failure_backoff_grows(),
     ]
     return 0 if all(results) else 1
 

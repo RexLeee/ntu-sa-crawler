@@ -261,7 +261,17 @@ def record_dispatch(request) -> None:
 
     request.meta[DISPATCH_TIME] = dispatched
     if _dispatch_log is not None:
-        _dispatch_log.write(f"{dispatched:.3f}", slot_id, request.url)
+        # Four columns. The wall clock stays first and keeps its meaning, so
+        # every existing reader of this file still works. The monotonic value
+        # is appended because the offline compliance check has to measure gaps
+        # with the same clock the guard used: a 48 hour run gives chronyd
+        # several chances to step time.time(), and the measured margin is only
+        # 135 ms (min gap 5.135s against a 5.000s floor). A backward step
+        # larger than that would fabricate a violation in the run's own
+        # evidence.
+        _dispatch_log.write(
+            f"{dispatched:.3f}", slot_id, request.url, f"{elapsed:.6f}"
+        )
 
 
 def close_dispatch_log() -> None:

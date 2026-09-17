@@ -37,12 +37,23 @@ def load_events(paths: list[Path], source: str) -> tuple[dict[str, list[float]],
     40,957 of 45,825 robots fetches timed out, so most of what the crawler
     sent was invisible here.
 
-    dispatched: dispatch_ts, slot_id, url. Written from the dispatch timer
-    itself, so it holds everything. This is the source the compliance claim
-    rests on; the other is kept because it is what earlier runs recorded.
+    dispatched: dispatch_ts, slot_id, url, monotonic_ts. Written from the
+    dispatch timer itself, so it holds everything. This is the source the
+    compliance claim rests on; the other is kept because it is what earlier
+    runs recorded.
+
+    Gaps are measured from the monotonic column when it is present, because
+    that is the clock the in-process guard compared. The wall clock can be
+    stepped by NTP, and the measured margin is 135 ms (a 5.135s minimum gap
+    against a 5.000s floor), so a backward step larger than that would
+    fabricate a violation. Logs written before that column existed have three
+    columns and fall back to the wall clock, which is what earlier runs were
+    verified with.
     """
     by_domain: dict[str, list[float]] = defaultdict(list)
     skipped = 0
+    monotonic_rows = 0
+    wall_rows = 0
     for path in paths:
         for lineno, line in enumerate(read_lines(path), 1):
             parts = line.rstrip("\n").split("\t")
@@ -62,13 +73,30 @@ def load_events(paths: list[Path], source: str) -> tuple[dict[str, list[float]],
             if parts[0] == "NA":
                 skipped += 1
                 continue
-            try:
-                ts = float(parts[0])
-            except ValueError:
-                print(f"{path}:{lineno}: bad timestamp, skipped", file=sys.stderr)
-                skipped += 1
-                continue
+            ts = None
+            if source == "dispatched" and len(parts) >= 4:
+                try:
+                    ts = float(parts[3])
+                    monotonic_rows += 1
+                except ValueError:
+                    ts = None
+            if ts is None:
+                try:
+                    ts = float(parts[0])
+                    wall_rows += 1
+                except ValueError:
+                    print(f"{path}:{lineno}: bad timestamp, skipped", file=sys.stderr)
+                    skipped += 1
+                    continue
             by_domain[key].append(ts)
+    if monotonic_rows and wall_rows:
+        # Mixing the two clocks inside one domain's series would produce
+        # meaningless gaps, so say so rather than print a verdict.
+        print(
+            f"WARNING: {monotonic_rows} rows carry a monotonic stamp and "
+            f"{wall_rows} do not; gaps spanning the boundary are not comparable",
+            file=sys.stderr,
+        )
     return by_domain, skipped
 
 

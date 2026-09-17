@@ -105,6 +105,13 @@ BLOOM_DUPEFILTER_ERROR_RATE = _mem["bloom_error_rate"]
 # dedupe state AND left a frontier the scheduler could not read. Shared by
 # crawler/dupefilter.py and crawler/scheduler.py so the two cannot drift.
 CHECKPOINT_INTERVAL = _mem["checkpoint_interval"]
+# The frontier save is spread over this many ticks instead of blocking the
+# reactor once per interval. A whole-frontier pass at 40,000 queues measured
+# 24.9-27.2s, against a 10s DOWNLOAD_TIMEOUT.
+CHECKPOINT_SLICES = _mem["checkpoint_slices"]
+# The Bloom filter save is one large write on the same thread. Offsetting it
+# stops the two savers landing on the same tick.
+BLOOM_CHECKPOINT_OFFSET = _mem["bloom_checkpoint_offset"]
 
 # Nothing in Scrapy caps the frontier, so a breadth-first crawl fills it about
 # 33x faster than it drains. This is the backstop.
@@ -116,6 +123,10 @@ FRONTIER_MAX_SIZE = _mem["frontier_max_size"]
 # cap. Each queue is two open files plus a directory, so this is the limit
 # that bounds RSS, descriptors and disk. See config.toml [memory].
 PQUEUE_MAX = _mem["pqueue_max"]
+# How far the new_domain exemption may push the frontier past its cap. The
+# spider tracks seen domains in bounded process memory, so a restart or an
+# eviction re-opens the exemption for domains already queued.
+FRONTIER_EXEMPT_SLACK = _mem["frontier_exempt_slack"]
 
 # Hard stop. Defaults to 0, meaning no limit at all.
 MEMUSAGE_ENABLED = True
@@ -130,6 +141,8 @@ ROBOTS_CACHE_SIZE = _mem["robots_cache_size"]
 # crawler/middlewares/robots.py.
 ROBOTS_STRICT_ON_FAILURE = _mem["robots_strict_on_failure"]
 ROBOTS_FAILURE_TTL = _mem["robots_failure_ttl"]
+# The backoff ceiling. A flat TTL re-asks a dead host 576 times in 48 hours.
+ROBOTS_FAILURE_TTL_MAX = _mem["robots_failure_ttl_max"]
 MAX_CRAWL_DELAY = _pol["max_crawl_delay"]
 
 # --- trimming ---------------------------------------------------------------

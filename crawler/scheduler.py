@@ -89,9 +89,17 @@ class CappedScheduler(Scheduler):
         obj = super().from_crawler(crawler)
         obj._cap = crawler.settings.getint("FRONTIER_MAX_SIZE", 3_000_000)
         obj._queue_cap = crawler.settings.getint("PQUEUE_MAX", 40_000)
+        # Ceiling for the new_domain exemption. See enqueue_request.
+        obj._exempt_cap = int(
+            obj._cap * crawler.settings.getfloat("FRONTIER_EXEMPT_SLACK", 1.1)
+        )
         obj._checkpoint_interval = crawler.settings.getfloat(
             "CHECKPOINT_INTERVAL", 0.0
         )
+        # A whole-frontier save blocked the reactor for 25s, so one pass is
+        # spread over this many ticks. See _checkpoint_slice.
+        obj._slices = max(1, crawler.settings.getint("CHECKPOINT_SLICES", 1))
+        obj._checkpoint_cursor = 0
         obj._size = 0
         obj._warned = False
         obj._queue_warned = False
@@ -208,36 +216,75 @@ class CappedScheduler(Scheduler):
             return
         from scrapy.utils.asyncio import create_looping_call
 
-        self._checkpoint_loop = create_looping_call(self.checkpoint)
-        self._checkpoint_loop.start(self._checkpoint_interval, now=False)
+        # One pass is split across _slices ticks, so the loop has to fire that
+        # many times per interval to still cover every queue once per interval.
+        self._checkpoint_loop = create_looping_call(self._checkpoint_slice)
+        period = self._checkpoint_interval / self._slices
+        self._checkpoint_loop.start(period, now=False)
 
-    def checkpoint(self) -> None:
-        """Save every live queue's metadata, bounding the post-kill scan.
+    def _iter_savable(self):
+        """Yield every queue that can persist its own metadata, in a stable order."""
+        for pq in list(getattr(self.dqs, "pqueues", {}).values()):
+            for attr in ("queues", "_start_queues"):
+                for queue in list(getattr(pq, attr, {}).values()):
+                    if getattr(queue, "save_info", None) is not None:
+                        yield queue
 
-        Without this, a killed shard has to rescan every record ever written
-        to each of its queues to work out what is still pending. With it the
-        scan covers one interval's worth of pops.
+    def _checkpoint_slice(self) -> None:
+        """Save one slice of the live queues, resuming where the last tick stopped.
 
-        This runs on the reactor thread, so the cost is measured and reported
-        rather than assumed. Politeness is unaffected: the delay is anchored
-        to the previous response's completion, so a pause here can only widen
-        a gap. A failure must not take the crawl down, since the checkpoint
-        exists to make a crash cheaper.
+        Saving all 40,000 queues in one call blocked the reactor for 24.9 to
+        27.2 seconds, measured as checkpoint/frontier_ms, and the reactor lag
+        samples at those moments showed 27.8 to 36.4 second stalls while
+        gc_max_ms was only 82 to 215 ms. So the cost is the synchronous writes
+        themselves, not garbage collection and not CPU contention.
+
+        That matters because DOWNLOAD_TIMEOUT is 10 seconds: any socket whose
+        timer expires inside the stall fails spuriously when the reactor
+        resumes. Slicing keeps each tick short while still covering every
+        queue once per checkpoint_interval.
+
+        Politeness is unaffected either way: the delay is anchored to the
+        previous response's completion, so a pause can only widen a gap. A
+        failure must not take the crawl down, since the checkpoint exists to
+        make a crash cheaper.
         """
         started = time.monotonic()
         saved = 0
         try:
-            for pq in getattr(self.dqs, "pqueues", {}).values():
-                for queue in list(getattr(pq, "queues", {}).values()):
-                    save = getattr(queue, "save_info", None)
-                    if save is not None:
-                        save()
-                        saved += 1
-                for queue in list(getattr(pq, "_start_queues", {}).values()):
-                    save = getattr(queue, "save_info", None)
-                    if save is not None:
-                        save()
-                        saved += 1
+            queues = list(self._iter_savable())
+            total = len(queues)
+            if total:
+                # Cursor walks the whole list across _slices ticks. The set of
+                # queues changes between ticks, so this is a best-effort sweep
+                # rather than an exact partition: a queue missed on one pass is
+                # picked up on the next, and its recovery scan just covers a
+                # little more than one interval.
+                per_tick = max(1, (total + self._slices - 1) // self._slices)
+                start = self._checkpoint_cursor % total
+                for i in range(min(per_tick, total)):
+                    queues[(start + i) % total].save_info()
+                    saved += 1
+                self._checkpoint_cursor = (start + saved) % total
+        except Exception as exc:
+            logger.warning("frontier checkpoint failed: %s", exc)
+        if self.stats is not None:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self.stats.max_value("checkpoint/frontier_slice_ms", elapsed_ms)
+            self.stats.inc_value("checkpoint/frontier_queues", saved)
+
+    def checkpoint(self) -> None:
+        """Save every live queue's metadata in one pass.
+
+        _checkpoint_slice is what the periodic loop calls; this is the
+        whole-frontier version, used at close and by the tests.
+        """
+        started = time.monotonic()
+        saved = 0
+        try:
+            for queue in self._iter_savable():
+                queue.save_info()
+                saved += 1
         except Exception as exc:
             logger.warning("frontier checkpoint failed: %s", exc)
         if self.stats is not None:
@@ -278,7 +325,16 @@ class CappedScheduler(Scheduler):
         # earlier version of this comment was missing: on its own the
         # exemption let the queue count grow without limit, and that is what
         # exhausted memory in a measured run.
-        if self._size >= self._cap and not request.meta.get("new_domain"):
+        #
+        # It also needs a ceiling of its own. The spider decides new_domain
+        # from process memory, so both a restart and an eviction from its
+        # bounded domain cache re-open the exemption for domains already in
+        # the frontier. A 2 hour run overshot by only 339 requests of
+        # 3,000,000, but that run never restarted; the count of domains that
+        # could claim the exemption again is the whole cache, so cap the
+        # overshoot rather than trusting the spider's bookkeeping to survive.
+        exempt = request.meta.get("new_domain") and self._size < self._exempt_cap
+        if self._size >= self._cap and not exempt:
             if not self._warned:
                 logger.info(
                     "frontier reached %d requests; dropping new ones until it drains",
@@ -287,6 +343,10 @@ class CappedScheduler(Scheduler):
                 self._warned = True
             if self.stats is not None:
                 self.stats.inc_value("scheduler/dropped/over_capacity")
+                if request.meta.get("new_domain"):
+                    # Separated so the report can tell a normal cap hit from
+                    # the exemption ceiling being reached.
+                    self.stats.inc_value("scheduler/dropped/over_exempt_cap")
             # Returning False makes the engine fire request_dropped, which is
             # the documented contract for BaseScheduler.enqueue_request.
             return False

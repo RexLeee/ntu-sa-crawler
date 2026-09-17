@@ -254,6 +254,30 @@ def run_scenario(name: str) -> int:
         print(f"FAIL [{name}]: dispatch log grouped under {keys}, expected 127.0.0.1")
         return 1
     print(f"PASS [{name}]: dispatch log holds {len(logged)} lines, all one slot")
+
+    # Column 4 is the monotonic stamp ops/verify_politeness.py prefers. It has
+    # to be present, parseable and strictly increasing, or the offline
+    # compliance check silently falls back to the NTP-steppable wall clock.
+    monos = []
+    for ln in logged:
+        cols = ln.split("\t")
+        if len(cols) < 4:
+            print(f"FAIL [{name}]: a dispatch row has {len(cols)} columns, expected 4")
+            return 1
+        try:
+            monos.append(float(cols[3]))
+        except ValueError:
+            print(f"FAIL [{name}]: monotonic column is not a number: {cols[3]!r}")
+            return 1
+    if any(b < a for a, b in zip(monos, monos[1:], strict=False)):
+        print(f"FAIL [{name}]: the monotonic column went backwards")
+        return 1
+    # And it must be a different clock from column 1, not a copy of it.
+    walls = [float(ln.split("\t")[0]) for ln in logged]
+    if all(abs(m - w) < 1.0 for m, w in zip(monos, walls, strict=True)):
+        print(f"FAIL [{name}]: column 4 looks like the wall clock, not monotonic")
+        return 1
+    print(f"PASS [{name}]: the monotonic column is present and increasing")
     return 0
 
 
@@ -456,7 +480,70 @@ def test_key_comes_from_the_url_not_meta() -> int:
     return 1
 
 
+def test_offline_check_uses_the_monotonic_column() -> int:
+    """The offline verdict must come from the clock the guard used.
+
+    A 48 hour run gives chronyd several chances to step time.time(), and the
+    margin is 135 ms (a 5.135s minimum gap against a 5.000s floor). A backward
+    step larger than that would fabricate a violation in the run's own
+    compliance evidence. The three-column form is what earlier runs recorded
+    and has to stay readable.
+    """
+    import gzip
+
+    # Wall clock steps back 2s between rows 2 and 3; monotonic is correct.
+    rows = [
+        (1000.000, "https://a.test/1", 500.000000),
+        (1005.200, "https://a.test/2", 505.200000),
+        (1008.400, "https://a.test/3", 510.400000),
+        (1013.600, "https://a.test/4", 515.600000),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        four = Path(td, "four.log.gz")
+        with gzip.open(four, "wt", encoding="utf-8") as fh:
+            for ts, url, mono in rows:
+                fh.write(f"{ts:.3f}\ta.test\t{url}\t{mono:.6f}\n")
+        three = Path(td, "three.log.gz")
+        with gzip.open(three, "wt", encoding="utf-8") as fh:
+            for ts, url, _ in rows:
+                fh.write(f"{ts:.3f}\ta.test\t{url}\n")
+
+        def run(path):
+            out = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent.parent / "ops" / "verify_politeness.py"),
+                    "--source",
+                    "dispatched",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return out.stdout
+
+        got = run(four)
+        if "VIOLATIONS  : 0" not in got or "5.200s" not in got:
+            print("FAIL [offline]: the monotonic column did not prevent a false violation")
+            print(got)
+            return 1
+        print("PASS [offline]: a stepped wall clock did not fabricate a violation")
+
+        # The old format must still parse, and on this data the wall clock
+        # genuinely shows a 3.2s gap, so it must still be reported.
+        got3 = run(three)
+        if "VIOLATIONS  : 1" not in got3 or "3.200s" not in got3:
+            print("FAIL [offline]: the 3-column format regressed")
+            print(got3)
+            return 1
+        print("PASS [offline]: the 3-column format still parses and still reports")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "offline":
+        return test_offline_check_uses_the_monotonic_column()
     if len(sys.argv) == 2 and sys.argv[1] == "guard":
         return test_guard_refuses_a_short_gap()
     if len(sys.argv) == 2 and sys.argv[1] == "key":
@@ -468,7 +555,7 @@ def main() -> int:
 
     # Parent: run each scenario in its own interpreter.
     failures = 0
-    for name in [*SCENARIOS, "guard", "key", "clock"]:
+    for name in [*SCENARIOS, "guard", "key", "clock", "offline"]:
         result = subprocess.run([sys.executable, __file__, name], check=False)
         failures += result.returncode != 0
     return 1 if failures else 0

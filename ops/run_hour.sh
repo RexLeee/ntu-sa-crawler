@@ -432,8 +432,15 @@ disk_free_mb() {
         # which is what this used to do despite the comment saying otherwise:
         # it threw away the healthy shard's remaining hours. The report is
         # built from the logs, so a run that ends with one shard is reportable.
-        GAVEUP=$(ls "$RUNDIR"/shard-*.gaveup 2>/dev/null | wc -l | tr -d ' ')
-        if [ "${GAVEUP:-0}" -ge "$SHARDS" ]; then
+        # Count the markers with a glob rather than `ls`. A non-matching glob
+        # makes `ls` exit non-zero, and under `set -e` that killed the run on
+        # the sampler's first iteration: the 48 hour run stopped 4 seconds in,
+        # having written the resources.tsv header and no samples.
+        GAVEUP=0
+        for marker in "$RUNDIR"/shard-*.gaveup; do
+            [ -e "$marker" ] && GAVEUP=$((GAVEUP + 1))
+        done
+        if [ "$GAVEUP" -ge "$SHARDS" ]; then
             echo "$(date -Iseconds) all $SHARDS shard(s) exhausted their restarts, stopping the run" \
                 >> "$SUPERVISOR_LOG"
             echo "all shards exhausted their restarts; see $SUPERVISOR_LOG" >&2

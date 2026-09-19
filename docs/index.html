@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="NTU IM 系統架構師的鍛造與培育 Starter Project：禮貌性優先的分散式廣度爬蟲，48 小時執行結果、架構設計與實作問題。">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Politeness-Critical Broad Crawler">
+<meta property="og:description" content="NTU IM 系統架構師的鍛造與培育 Starter Project：禮貌性優先的分散式廣度爬蟲，48 小時執行結果、架構設計與實作問題。">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%95%B8%EF%B8%8F</text></svg>">
+<style>
+/* The reset the Artifact runtime normally injects. No background here: the
+   page's own token-based body rule owns the ground, so a literal colour
+   would fight its dark theme. */
+:root{color-scheme:light dark}
+body{margin:0;font:14px system-ui,-apple-system,'Segoe UI',sans-serif}
+img{max-width:100%}
+[hidden]{display:none!important}
+</style>
+<title>Politeness-Critical Broad Crawler</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+:root{
+  --paper:#FAF9F7; --surface:#FFFFFF; --sunk:#F1EFEB;
+  --ink:#1A1F26; --ink-soft:#4A545E; --slate:#6B7580;
+  --rule:#DFDAD2; --rule2:#C6BFB4;
+  --amber:#C2611F; --amber-bg:#F7EDE3;
+  --green:#2D7D5A; --green-bg:#E5F1EA;
+  --red:#A8382F; --red-bg:#F8E6E3;
+  --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  --serif:'Newsreader',Georgia,serif;
+  --sans:system-ui,-apple-system,'Segoe UI',sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1419; --surface:#161C23; --sunk:#12181E;
+    --ink:#E8E4DE; --ink-soft:#AAB2BA; --slate:#8A939D;
+    --rule:#28313A; --rule2:#3B4650;
+    --amber:#E8893F; --amber-bg:#251A10;
+    --green:#4FB183; --green-bg:#11231B;
+    --red:#DE6A5E; --red-bg:#261412;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1419; --surface:#161C23; --sunk:#12181E;
+  --ink:#E8E4DE; --ink-soft:#AAB2BA; --slate:#8A939D;
+  --rule:#28313A; --rule2:#3B4650;
+  --amber:#E8893F; --amber-bg:#251A10;
+  --green:#4FB183; --green-bg:#11231B;
+  --red:#DE6A5E; --red-bg:#261412;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.7;
+  margin:0; padding:0; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:900px;margin:0 auto;padding-inline:20px;padding-block:0}
+
+/* ===== masthead ===== */
+.mast{border-bottom:2px solid var(--ink);padding-block:44px 28px}
+.kicker{
+  font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--slate);margin-bottom:20px;
+}
+h1{
+  font-family:var(--serif);font-weight:500;
+  font-size:clamp(2rem,5.5vw,3.1rem);line-height:1.1;letter-spacing:-.02em;
+  margin:0 0 14px;text-wrap:balance;
+}
+.standfirst{
+  font-family:var(--serif);font-size:clamp(1.05rem,2.4vw,1.28rem);
+  color:var(--ink-soft);margin:0;max-width:60ch;line-height:1.5;
+}
+.repo{
+  display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;
+  margin:18px 0 0;font-family:var(--mono);font-size:13px;
+}
+.repo a{color:var(--amber);text-decoration-thickness:1px;text-underline-offset:3px;overflow-wrap:break-word}
+.repo span{
+  font-size:9.5px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--slate);border:1px solid var(--rule2);padding:2px 6px;
+}
+
+/* ===== facts strip ===== */
+.facts{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+  gap:1px;background:var(--rule);border:1px solid var(--rule);margin-block:28px;
+}
+.fact{background:var(--surface);padding:12px 14px}
+.fact-k{
+  font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--slate);margin-bottom:4px;
+}
+.fact-v{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--ink)}
+
+/* ===== live banner ===== */
+.live{
+  display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+  background:var(--amber-bg);border:1px solid var(--amber);border-left-width:3px;
+  padding:14px 16px;margin-block:0 34px;
+}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--amber);flex:none;animation:p 2.4s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+.live-t{font-size:14.5px;line-height:1.55;flex:1 1 320px;min-width:0;margin:0}
+.bar{flex:1 1 180px;min-width:150px;height:7px;background:var(--surface);border:1px solid var(--rule2);position:relative;overflow:hidden}
+.bar i{position:absolute;inset:0 auto 0 0;width:94.4%;background:var(--amber)}
+.bar-n{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--amber);flex:none}
+
+/* ===== sections ===== */
+section{padding-block:44px;border-bottom:1px solid var(--rule)}
+section:last-of-type{border-bottom:0;padding-bottom:56px}
+.snum{
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.14em;
+  color:var(--amber);text-transform:uppercase;margin-bottom:9px;
+}
+h2{
+  font-family:var(--serif);font-weight:500;
+  font-size:clamp(1.5rem,3.6vw,2.05rem);line-height:1.18;letter-spacing:-.012em;
+  margin:0 0 12px;text-wrap:balance;
+}
+.lede{font-size:16.5px;color:var(--ink-soft);margin:0 0 28px;max-width:66ch}
+h3{
+  font-family:var(--serif);font-size:1.24rem;font-weight:600;line-height:1.3;
+  margin:36px 0 12px;letter-spacing:-.005em;text-wrap:balance;
+}
+h4{
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--slate);margin:30px 0 12px;
+}
+p{margin:0 0 16px;max-width:68ch}
+strong{font-weight:600;color:var(--ink)}
+code{
+  font-family:var(--mono);font-size:.86em;background:var(--sunk);
+  padding:.12em .36em;border-radius:2px;overflow-wrap:break-word;
+}
+.muted{font-size:14px;color:var(--slate);max-width:66ch;margin:0 0 24px}
+
+/* ===== plain bullet list: NO grid, marker via ::marker ===== */
+ul.b{margin:0 0 20px;padding-left:20px;max-width:68ch;list-style:none}
+ul.b > li{position:relative;margin-bottom:11px;line-height:1.65}
+ul.b > li::before{
+  content:"▸";position:absolute;left:-18px;top:0;
+  color:var(--amber);font-size:11px;line-height:1.85;
+}
+ul.b > li > b:first-child{color:var(--ink);font-weight:600}
+ol.n{margin:0 0 20px;padding-left:22px;max-width:68ch}
+ol.n li{margin-bottom:10px;line-height:1.65}
+
+/* ===== tier1 metric cards ===== */
+.t1grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-block:4px 26px}
+.t1{background:var(--surface);border:1px solid var(--rule2);border-top:3px solid var(--amber);padding:20px}
+.t1-k{
+  font-family:var(--mono);font-size:10.5px;font-weight:500;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--slate);margin-bottom:11px;
+}
+.t1-v{
+  font-family:var(--mono);font-size:clamp(1.7rem,4.4vw,2.4rem);font-weight:700;
+  line-height:1;letter-spacing:-.03em;font-variant-numeric:tabular-nums;
+  margin-bottom:9px;overflow-wrap:break-word;
+}
+.t1-d{font-size:13.5px;color:var(--ink-soft);line-height:1.5;margin:0}
+.tag{
+  display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;padding:2px 6px;
+  border:1px solid currentColor;line-height:1.4;vertical-align:1px;
+}
+.tag-l{color:var(--amber);background:var(--amber-bg)}
+.tag-f{color:var(--green);background:var(--green-bg)}
+.tag-o{color:var(--red);background:var(--red-bg)}
+
+/* ===== verdict ===== */
+.verdict{background:var(--green-bg);border:1px solid var(--green);border-left-width:3px;padding:20px 22px;margin-block:4px 28px}
+.v-row{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px}
+.v-n{font-family:var(--mono);font-size:clamp(2rem,5vw,2.8rem);font-weight:700;line-height:1;color:var(--green);letter-spacing:-.03em}
+.v-h{font-family:var(--serif);font-size:1.25rem;font-weight:600}
+.verdict p{margin:0;font-size:14.5px;color:var(--ink-soft);max-width:64ch}
+
+/* ===== tables ===== */
+.tw{overflow-x:auto;margin-block:14px 26px;border:1px solid var(--rule2);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:min(100%,500px)}
+caption{
+  font-family:var(--mono);font-size:10.5px;font-weight:500;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--slate);text-align:left;
+  padding:11px 14px;border-bottom:1px solid var(--rule);background:var(--sunk);
+}
+th,td{padding:9px 14px;text-align:left;border-bottom:1px solid var(--rule);vertical-align:top}
+thead th{
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--slate);background:var(--sunk);white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:0}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;font-size:13.5px}
+.mn{font-family:var(--mono);font-size:12.5px}
+.ok{color:var(--green);font-weight:600}
+.no{color:var(--red);font-weight:600}
+
+/* ===== proof / code blocks ===== */
+.proof{background:var(--sunk);border:1px solid var(--rule2);padding:18px 20px;margin-block:14px 24px;overflow-x:auto}
+.proof pre{font-family:var(--mono);font-size:12.5px;line-height:1.85;margin:0;white-space:pre;color:var(--ink)}
+.proof p{font-size:14.5px;color:var(--ink-soft);margin:15px 0 0;padding-top:14px;border-top:1px solid var(--rule);max-width:64ch}
+.flow{background:var(--sunk);border:1px solid var(--rule2);padding:16px;margin-block:14px 10px;overflow-x:auto}
+.flow pre{font-family:var(--mono);font-size:11px;line-height:1.7;margin:0;white-space:pre;color:var(--ink-soft)}
+
+/* ===== funnel ===== */
+.funnel{display:grid;margin-block:16px 10px;border:1px solid var(--rule2)}
+.fstep{display:grid;grid-template-columns:34px 1fr auto;gap:14px;align-items:start;background:var(--surface);padding:13px 16px;border-bottom:1px solid var(--rule)}
+.fstep:last-child{border-bottom:0}
+.fstep-n{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--amber);padding-top:3px}
+.fstep-b{min-width:0}
+.fstep-t{font-family:var(--mono);font-size:13px;font-weight:500;margin-bottom:4px}
+.fstep-d{font-size:13.5px;color:var(--ink-soft);line-height:1.55;margin:0}
+.fstep-v{font-family:var(--mono);font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right;padding-top:1px}
+.fstep-v small{display:block;font-size:9px;font-weight:500;color:var(--slate);letter-spacing:.07em;margin-top:2px}
+.fstep.out{border-left:3px solid var(--green)}
+.fstep.out .fstep-n,.fstep.out .fstep-v{color:var(--green)}
+
+/* ===== module list ===== */
+.mods{border:1px solid var(--rule2);margin-block:14px 26px}
+.mgrp{
+  background:var(--sunk);padding:9px 16px;border-bottom:1px solid var(--rule);
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--slate);
+}
+.mod{display:grid;grid-template-columns:minmax(140px,190px) 1fr;gap:5px 18px;background:var(--surface);padding:12px 16px;border-bottom:1px solid var(--rule)}
+.mod:last-child{border-bottom:0}
+.mod-f{font-family:var(--mono);font-size:12.5px;font-weight:500;color:var(--amber);overflow-wrap:break-word}
+.mod-d{font-size:14px;color:var(--ink-soft);line-height:1.55}
+@media (max-width:620px){.mod{grid-template-columns:1fr;gap:4px}}
+
+/* ===== note callouts ===== */
+.note{border-left:3px solid var(--rule2);padding:2px 0 2px 16px;margin-block:20px;max-width:66ch}
+.note.warn{border-left-color:var(--red)}
+.note.key{border-left-color:var(--amber)}
+.note-k{
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--slate);display:block;margin-bottom:6px;
+}
+.note.warn .note-k{color:var(--red)}
+.note.key .note-k{color:var(--amber)}
+.note p:last-child{margin-bottom:0}
+
+/* ===== problem cards ===== */
+.prob{background:var(--surface);border:1px solid var(--rule2);border-left:3px solid var(--red);padding:17px 19px;margin-block:16px}
+.prob.fixed{border-left-color:var(--green)}
+.prob.mine{border-left-color:var(--amber)}
+.prob-h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
+.prob-t{font-family:var(--serif);font-size:1.1rem;font-weight:600;line-height:1.3;flex:1 1 220px;min-width:0}
+.prob dl{display:grid;grid-template-columns:minmax(74px,88px) 1fr;gap:7px 14px;margin:0;font-size:14px}
+.prob dt{
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--slate);padding-top:4px;
+}
+.prob dd{margin:0;color:var(--ink-soft);line-height:1.55;min-width:0;overflow-wrap:break-word}
+@media (max-width:560px){.prob dl{grid-template-columns:1fr;gap:2px 0}.prob dt{padding-top:10px}}
+
+/* ===== chart ===== */
+.chart{background:var(--surface);border:1px solid var(--rule2);padding:18px 18px 12px;margin-block:14px 10px}
+.chart svg{display:block;width:100%;height:auto}
+.leg{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:13px;padding-top:12px;border-top:1px solid var(--rule);font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+.leg span{display:flex;align-items:center;gap:7px}
+.sw{width:13px;height:3px;flex:none}
+
+@media (max-width:620px){
+  .mast{padding-block:32px 22px}
+  section{padding-block:34px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="mast">
+  <p class="kicker">NTU IM · 系統架構師的鍛造與培育 · Starter Project · 2026-09-19</p>
+  <h1>禮貌性優先的分散式廣度爬蟲</h1>
+  <p class="standfirst">在一台兩核心、7.9 GB 記憶體的機器上連續執行 48 小時，發現 1.71 億個網址、成功抓取 896 萬頁，全程對每個網站的請求速率零違規。</p>
+  <p class="repo"><a href="https://github.com/RexLeee/ntu-sa-crawler" target="_blank" rel="noopener">github.com/RexLeee/ntu-sa-crawler</a><span>原始碼</span></p>
+</header>
+
+<div class="facts">
+  <div class="fact"><div class="fact-k">執行時數</div><div class="fact-v">48 小時</div></div>
+  <div class="fact"><div class="fact-k">機器</div><div class="fact-v">2 vCPU / 7.9 GB</div></div>
+  <div class="fact"><div class="fact-k">起始網址</div><div class="fact-v">1,000 個</div></div>
+  <div class="fact"><div class="fact-k">發現網址</div><div class="fact-v">171 M</div></div>
+  <div class="fact"><div class="fact-k">成功抓取</div><div class="fact-v">9.0 M</div></div>
+  <div class="fact"><div class="fact-k">速率違規</div><div class="fact-v ok" style="color:var(--green)">0</div></div>
+</div>
+
+<div class="live">
+  <span class="dot" aria-hidden="true"></span>
+  <p class="live-t">本報告在爬蟲執行中發布。標記 <span class="tag tag-l">Live</span> 的數字會在台灣時間今晚 21:14 結束後更新為最終值，連結不變。標記 <span class="tag tag-f">Final</span> 的已定稿。</p>
+  <div class="bar" role="img" aria-label="進度 45 小時，共 48 小時"><i></i></div>
+  <span class="bar-n">45 / 48 h</span>
+</div>
+
+<!-- ========== 01 ========== -->
+<section>
+  <p class="snum">01 — 執行結果</p>
+  <h2>Tier 1 指標</h2>
+  <p class="lede">作業要求兩個數字：發現的網址總數，以及成功抓取的網址總數。兩者都不含 sitemap 檔案裡的網址。</p>
+
+  <div class="t1grid">
+    <div class="t1">
+      <div class="t1-k">發現的網址總數 <span class="tag tag-l">Live</span></div>
+      <div class="t1-v">170,507,135</div>
+      <p class="t1-d">去重後的相異網址。爬蟲在每頁的連結中找到它們，經過正規化與去重後計數。</p>
+    </div>
+    <div class="t1">
+      <div class="t1-k">成功抓取的網址總數 <span class="tag tag-l">Live</span></div>
+      <div class="t1-v">8,963,530</div>
+      <p class="t1-d">每一筆都實際收到伺服器回應。平均每小時約 21.8 萬頁。</p>
+    </div>
+    <div class="t1">
+      <div class="t1-k">觸及的網站數 <span class="tag tag-l">Live</span></div>
+      <div class="t1-v">≈ 1.2 M</div>
+      <p class="t1-d">以「註冊域」計算，例如 <code>example.com</code>。這是速率限制的單位。</p>
+    </div>
+  </div>
+
+  <div class="note key">
+    <span class="note-k">為什麼發現的數量是抓取的 20 倍</span>
+    <p>這不是失敗，而是規則造成的必然結果。每抓一頁平均找到 49 個新連結，但抓那一頁就用掉了該網站 5 秒的配額。<strong>新網址進來的速度是能抓走的 33 倍</strong>，所以待抓清單永遠在成長。48 小時內能抓到的量，由「同時持有多少個網站」乘上時間決定，不由清單長度決定。</p>
+  </div>
+
+  <h3>sitemap 為什麼確定被排除</h3>
+  <p>爬蟲從不主動抓取 <code>sitemap.xml</code>，也從不讀取 robots.txt 裡的 <code>Sitemap:</code> 指示行。網址只有一個來源：實際抓到的 HTML 頁面裡的 <code>&lt;a href&gt;</code> 連結。<strong>所以排除是由程式結構保證的，不是事後過濾掉的。</strong></p>
+
+  <h3>回應狀態分佈</h3>
+  <div class="tw">
+    <table>
+      <caption>HTTP 狀態碼 — part 1 shard 0，共 799 萬個回應</caption>
+      <thead><tr><th>狀態碼</th><th class="num">數量</th><th class="num">佔比</th><th>意義</th></tr></thead>
+      <tbody>
+        <tr><td class="mn">200 OK</td><td class="num">5,965,342</td><td class="num">74.6%</td><td>成功取得頁面</td></tr>
+        <tr><td class="mn">301 / 302 / 308</td><td class="num">1,156,474</td><td class="num">14.5%</td><td>重導向，爬蟲最多跟隨 2 次</td></tr>
+        <tr><td class="mn">404 Not Found</td><td class="num">642,994</td><td class="num">8.0%</td><td>頁面已不存在</td></tr>
+        <tr><td class="mn">403 Forbidden</td><td class="num">126,507</td><td class="num">1.6%</td><td>伺服器拒絕</td></tr>
+        <tr><td class="mn">其他</td><td class="num">101,942</td><td class="num">1.3%</td><td>408 逾時、429 限流等</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>資源使用</h3>
+  <div class="tw">
+    <table>
+      <caption>48 小時資源用量 vs 上限</caption>
+      <thead><tr><th>資源</th><th class="num">上限</th><th class="num">實測峰值</th><th>結果</th></tr></thead>
+      <tbody>
+        <tr><td>記憶體（每行程）</td><td class="num">2,800 MB</td><td class="num">2,716 MB</td><td><span class="ok">未觸發</span>，餘裕 84 MB</td></tr>
+        <tr><td>檔案描述符</td><td class="num">1,048,576</td><td class="num">93,213</td><td><span class="ok">遠低於上限</span></td></tr>
+        <tr><td>磁碟</td><td class="num">96 GB</td><td class="num">12 GB 已用</td><td><span class="ok">剩餘 84 GB</span></td></tr>
+        <tr><td>被作業系統強制終止</td><td class="num">0 次</td><td class="num">0 次</td><td><span class="ok">爬蟲全程存活</span></td></tr>
+        <tr><td>非預期重啟</td><td class="num">—</td><td class="num">0 次</td><td><span class="ok">監督日誌為空</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="chart">
+    <svg viewBox="0 0 700 250" role="img" aria-label="三個資源上限在執行 1.2 小時內全部達到並保持到結束">
+      <text x="0" y="12" font-family="'JetBrains Mono',monospace" font-size="10.5" font-weight="700" fill="var(--slate)" letter-spacing=".8">三個資源上限在 1.2 小時內全部達到，並保持到結束</text>
+      <line x1="46" y1="38" x2="686" y2="38" stroke="var(--rule)"/>
+      <line x1="46" y1="88" x2="686" y2="88" stroke="var(--rule)"/>
+      <line x1="46" y1="138" x2="686" y2="138" stroke="var(--rule)"/>
+      <line x1="46" y1="188" x2="686" y2="188" stroke="var(--rule)"/>
+      <line x1="46" y1="205" x2="686" y2="205" stroke="var(--rule2)"/>
+      <text x="40" y="42" text-anchor="end" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">100%</text>
+      <text x="40" y="92" text-anchor="end" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">75%</text>
+      <text x="40" y="142" text-anchor="end" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">50%</text>
+      <text x="40" y="192" text-anchor="end" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">25%</text>
+      <path d="M46 205 L52 110 L58 56 L64 40 L68 38 L686 38" fill="none" stroke="var(--green)" stroke-width="2.4"/>
+      <path d="M46 205 L58 196 L74 178 L94 150 L114 118 L132 86 L148 58 L160 42 L166 38 L686 38" fill="none" stroke="var(--amber)" stroke-width="2.4"/>
+      <path d="M46 205 L70 190 L100 170 L130 146 L160 118 L190 90 L220 62 L250 44 L268 38 L310 42 L350 38 L390 48 L430 40 L470 38 L510 46 L550 38 L590 44 L630 38 L686 41" fill="none" stroke="var(--slate)" stroke-width="1.8" stroke-dasharray="5 3"/>
+      <circle cx="68" cy="38" r="3.2" fill="var(--green)"/>
+      <circle cx="166" cy="38" r="3.2" fill="var(--amber)"/>
+      <text x="74" y="31" font-family="'JetBrains Mono',monospace" font-size="9" fill="var(--green)">0.37 h</text>
+      <text x="172" y="60" font-family="'JetBrains Mono',monospace" font-size="9" fill="var(--amber)">1.17 h</text>
+      <text x="46" y="222" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">0 h</text>
+      <text x="206" y="222" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">12 h</text>
+      <text x="366" y="222" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">24 h</text>
+      <text x="526" y="222" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">36 h</text>
+      <text x="686" y="222" text-anchor="end" font-family="'JetBrains Mono',monospace" font-size="9.5" fill="var(--slate)">48 h</text>
+      <text x="366" y="241" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9" font-style="italic" fill="var(--slate)">各自佔上限的百分比</text>
+    </svg>
+    <div class="leg">
+      <span><i class="sw" style="background:var(--green)"></i>robots 規則快取 / 50,000</span>
+      <span><i class="sw" style="background:var(--amber)"></i>待抓清單 / 300 萬</span>
+      <span><i class="sw" style="background:var(--slate)"></i>網站佇列數 / 40,000</span>
+    </div>
+  </div>
+  <p class="muted">三條線都在 1.2 小時內到頂並保持。這是設計成立的直接證據：資源被上限綁住，而不是隨時間線性成長到耗盡。</p>
+</section>
+
+<!-- ========== 02 ========== -->
+<section>
+  <p class="snum">02 — 合規設計</p>
+  <h2>如何保證零違規</h2>
+  <p class="lede">作業的要求是「<strong>NO violation</strong>」，不是「盡量遵守」。兩條規則：遵守 robots.txt，以及每個網站每秒最多 0.2 次請求（等於間隔至少 5 秒）。</p>
+
+  <div class="verdict">
+    <div class="v-row">
+      <span class="v-n">0</span>
+      <span class="v-h">違規，橫跨 2,180 萬次請求</span>
+    </div>
+    <p>記錄違規的兩個檔案全程皆為 0 bytes，且檔案時間戳停在爬蟲啟動那一刻，證明它從頭到尾沒被寫入過。程式內的檢查器計數為零。</p>
+  </div>
+
+  <h3>難點：Scrapy 內建的延遲管不到真正的發送時間</h3>
+  <p>我們用的爬蟲框架 Scrapy 有一個「每網站延遲」設定，但它計時的起點是<strong>從待抓佇列取出請求的時刻</strong>，不是實際送出封包的時刻。取出之後，請求交給事件迴圈排隊，何時真正發送是另一回事。</p>
+  <p>在這台機器上這個差別很致命：CPU 滿載時，一個設定 0.5 秒的計時器<strong>實際中位數遲到 1.3 到 4.6 秒</strong>。取出的間隔和伺服器看到的間隔幾乎無關。</p>
+  <p>我先試過最直覺的做法：把延遲從 5.0 秒加大到 5.5 秒當保險。<strong>仍然量到 4.941 秒的間隔。</strong>因為延遲抖動的尾端不是靠固定餘裕能吃掉的。</p>
+
+  <h3>解法：把計時起點改成「上一個回應完成的時刻」</h3>
+  <p>改動很小，但它把保證從「靠餘裕」變成「靠邏輯」。每一步的不等式都指向同一個方向：</p>
+
+  <div class="proof">
+<pre>取出 B  ≥  A 完成 + 5 秒      ← 這是本改動
+送出 B  ≥  取出 B             ← 送出必定不早於取出
+A 送出  ≤  A 完成             ← 回應必定晚於送出
+──────────────────────────
+送出 B  ≥  A 送出 + 5 秒      ∎</pre>
+    <p><strong>三個不等式同向，所以系統再忙、再延遲，只能讓間隔變得更長，不可能變短。</strong>搭配「同一網站同時只允許一個請求在傳輸」的設定，就不會有兩個請求同時在飛而搞錯順序。這與 Heritrix、Nutch 兩個業界爬蟲的做法相同。</p>
+  </div>
+
+  <div class="note">
+    <span class="note-k">付出的代價</span>
+    <p>一個網站現在每「5 秒 + 來回時間」產出一頁，而非每 5 秒一頁。在 1.5 秒的來回時間下，單一網站少約 20% 的頁。<strong>總量沒有損失</strong>，因為瓶頸是 CPU，而不是可用網站的數量：同時有 5,000 到 10,000 個網站可抓，理論上允許每秒 1,568 頁，實際只做到 28 頁。</p>
+  </div>
+
+  <h3>三層防線</h3>
+  <div class="tw">
+    <table>
+      <caption>合規的三個層次</caption>
+      <thead><tr><th>層</th><th>做什麼</th><th>失效時的後果</th></tr></thead>
+      <tbody>
+        <tr><td class="mn">1. 限制器</td><td>用上述邏輯排定每個請求的發送時間</td><td>（結構上不會失效）</td></tr>
+        <tr><td class="mn">2. 檢查器</td><td>在開啟網路連線前的最後一刻量測間隔，不足就丟棄該頁並存下現場</td><td>丟一頁，計數 +1</td></tr>
+        <tr><td class="mn">3. 離線驗證</td><td>事後從完整送出紀錄重算每一對間隔</td><td>報告會顯示違規</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">第 2 層在設計上永遠不該觸發。它存在的理由很實際：「不該發生」這句話在這個專案上已經錯過四次，而<strong>丟掉一頁遠比違規一次便宜</strong>。</p>
+
+  <h3>四次真實違規，都來自「量錯了對象」</h3>
+  <p>這張表是整個設計的來源。每一列都是開發過程中真的發生過的違規。</p>
+  <div class="tw">
+    <table>
+      <caption>開發期間的違規與根因</caption>
+      <thead><tr><th>網站</th><th class="num">實測間隔</th><th>原因</th><th>修法</th></tr></thead>
+      <tbody>
+        <tr><td class="mn">poki.com</td><td class="num no">0.0005 秒</td><td>用「睡眠」實作等待。睡眠只保證下限，兩個睡眠超時量不同，排後面的可能先醒。</td><td>不自己計時，改用上述邏輯</td></tr>
+        <tr><td class="mn">panasonic.jp</td><td class="num no">0.001 秒</td><td>用記憶體位址當網站識別。位址被回收後幾乎立刻被重用（實測 2,000 次配置中 1,999 次重用）。</td><td>改用網域名稱當識別，並把歷史存在會被回收的物件之外</td></tr>
+        <tr><td class="mn">developer.google.com</td><td class="num no">時間戳相同</td><td>重導向複製了來源網站的計時器。</td><td>計時器一律從網址推導，不從請求屬性複製</td></tr>
+        <tr><td class="mn">openhomefoundation.org</td><td class="num no">0.056 秒</td><td>頁面自動跳轉時繼承了來源的計時器。</td><td>同上，並關閉自動跳轉追蹤</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>只記錄成功的頁面是不夠的</h3>
+  <ul class="b">
+    <li><b>問題：</b>成功頁面的紀錄檔是在解析頁面時寫的，所以只含成功的 HTML。它漏掉每個失敗的請求，以及每次 robots.txt 的抓取——<strong>而這些都真實佔用了該網站的 5 秒配額</strong>。</li>
+    <li><b>規模有多大：</b>實測某次執行，45,825 次 robots.txt 抓取有 40,957 次逾時。爬蟲送出的大部分，對「成功紀錄檔」是隱形的。</li>
+    <li><b>所以另外記錄每一次送出：</b>一行一筆，含時間、網站、網址。48 小時共 591 MB 壓縮資料。<strong>合規主張建立在這個檔案上。</strong></li>
+  </ul>
+
+  <h3>robots.txt：讀不到就不抓</h3>
+  <p>這是一個刻意違反業界慣例的決定。Scrapy 和多數爬蟲把「讀不到 robots.txt」當成「可以全部抓」。因為作業要求 NO violation，這裡反過來：<strong>讀不到就拒絕抓</strong>。</p>
+  <p>這不是理論顧慮。實測某次執行在 <code>www.eia.gov</code> 抓了兩個明確被禁止的網址，原因是一次短暫的網路失敗，讓程式把該網站的規則記成「未知」，而「未知」當時被當成「允許」。</p>
+
+  <div class="tw">
+    <table>
+      <caption>robots.txt 處理 — 三處對預設行為的修正</caption>
+      <thead><tr><th>問題</th><th>預設行為</th><th>本專案</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr><td>規則快取</td><td>永不清除</td><td>上限 50,000 個網站</td><td>單一規則檔可達 369 KB。這個快取是某次執行記憶體衝到 5.3 GB 的主因。</td></tr>
+        <tr><td>讀不到時</td><td>視為可全抓</td><td>拒絕該請求</td><td>eia.gov 的兩個禁止路徑被抓到</td></tr>
+        <tr><td>失敗後重試</td><td>無節制</td><td>300 秒起倍增，上限 4 小時</td><td>固定間隔會讓一個已下線的網站在 48 小時內被重問 576 次，每次都浪費一個 5 秒配額</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">爬蟲也真正套用了 robots.txt 裡的 <code>Crawl-delay</code>（要求更慢的抓取速度），上限 60 秒。Scrapy 會讀這個欄位但從不套用，這是框架的已知問題。</p>
+</section>
+
+<!-- ========== 03 ========== -->
+<section>
+  <p class="snum">03 — 演算法</p>
+  <h2>演算法設計</h2>
+  <p class="lede">整個系統的設計不是從「怎麼抓得快」出發，而是從一條不等式出發。</p>
+
+  <div class="proof">
+<pre>每秒頁數  ≤  (同時持有的網站數) ÷ 5 秒</pre>
+    <p>每個網站 5 秒一次，代表<strong>單一網站 48 小時最多產出 34,560 頁</strong>。想提高總量，唯一的路是同時持有更多網站。以下每個決策都是這條不等式的後果。</p>
+  </div>
+
+  <div class="tw">
+    <table>
+      <caption>四個從不等式推導出的決策</caption>
+      <thead><tr><th>決策</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr><td><strong>廣度優先</strong>，不深入單一網站</td><td>深入挖一個網站沒有意義，因為它有 34,560 頁的硬上限</td></tr>
+        <tr><td><strong>新網站的第一個網址享有特權</strong></td><td>就算待抓清單已滿，新網站仍然收。網站數成長曲線就是產能曲線</td></tr>
+        <tr><td><strong>待抓清單放磁碟</strong>，不放記憶體</td><td>清單成長速度是消耗速度的 33 倍，記憶體撐不住</td></tr>
+        <tr><td><strong>用機率式去重</strong>，不用精確集合</td><td>1 億個網址用精確集合要 13 GB，機率式只要 240 MB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>三個上限，管三種不同的資源</h3>
+  <p>這是記憶體設計的核心，而它來自一次失敗。前一輪測試把<strong>待抓請求數</strong>限制在 300 萬，但<strong>網站佇列數</strong>仍然從 46,788 成長到 132,779，最後被作業系統強制終止。</p>
+  <div class="note key">
+    <span class="note-k">學到的事</span>
+    <p>「待抓請求的數量」和「網站佇列的數量」是<strong>兩種不同的資源</strong>，必須分別設上限。每個網站的佇列都持有兩個開啟的檔案和一個磁碟目錄，這些成本與裡面裝了幾個請求無關。</p>
+  </div>
+
+  <div class="tw">
+    <table>
+      <caption>三個上限</caption>
+      <thead><tr><th>上限</th><th class="num">值</th><th>管什麼</th><th>為什麼是這個數字</th></tr></thead>
+      <tbody>
+        <tr><td>待抓請求數</td><td class="num">3,000,000</td><td>磁碟空間</td><td>清單更長買不到任何東西：實測一小時只抓走了放進去的 6.6%</td></tr>
+        <tr><td>網站佇列數</td><td class="num">40,000</td><td>記憶體、檔案描述符、目錄數</td><td>低於 robots 快取的 50,000，避免規則被重複抓取；產能餘裕 80 倍</td></tr>
+        <tr><td>單一網站待抓數</td><td class="num">500</td><td>防止一個網站佔滿額度</td><td>一個網站以 5 秒一次抓完 500 頁要 42 分鐘</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>讓「挑下一個網站」不用掃過全部</h3>
+  <ul class="b">
+    <li><b>問題：</b>框架原本的做法每次都掃過所有網站佇列，而這個動作每秒執行 100 到 200 次。在 5,000 個佇列下是每秒五十萬次記憶體配置。</li>
+    <li><b>實測：</b>效能分析顯示它佔<strong>全部 CPU 的 52%</strong>，而真正解析網頁只佔 5%。</li>
+    <li><b>關鍵觀察：</b>因為每個網站同時只允許一個請求，所以「挑在途最少的」實際上等於「<strong>找一個手上沒事的網站</strong>」——而找一個，不需要看過全部。</li>
+    <li><b>解法：</b>把網站排成一個環，走到第一個空閒的就停，跳過的移到環尾。平均只需檢查一個。</li>
+  </ul>
+
+  <h3>從強制終止中復原</h3>
+  <p>框架只在「正常關閉」時才把待抓清單的索引寫到磁碟。被強制終止的行程重啟後，會看到一堆裝滿真實請求的資料檔，卻沒有對應的索引。後果是三步連鎖：</p>
+  <ol class="n">
+    <li>程式讀不到索引檔，回報「這個佇列是空的」</li>
+    <li>框架關閉任何回報為空的佇列</li>
+    <li>關閉一個「空」佇列時，程式會<strong>刪掉它的資料檔</strong></li>
+  </ol>
+  <div class="note warn">
+    <span class="note-k">所以續跑不只是看不到清單，而是摧毀它</span>
+    <p>實測某次執行這樣損失了 2.6 GB、300 萬個待抓請求。接手的行程抓了零頁，然後在 <strong>1.66 秒</strong>後結束。</p>
+  </div>
+  <ul class="b">
+    <li><b>修法上半：</b>不信任索引檔，改成<strong>掃描磁碟上實際存在的目錄</strong>來重建它。</li>
+    <li><b>修法下半：</b>掃描資料檔重算內容。每筆紀錄的開頭是它自己的長度，所以可以一筆一筆跳過去，精確算出還剩幾筆。</li>
+    <li><b>順手省下 1.1 GB：</b>每個佇列的兩個檔案各配置了 8 KB 緩衝區，<strong>而程式根本不使用它們</strong>。兩個獨立量測都得到每佇列 9.1 KB 的浪費。關掉緩衝就省下來了。</li>
+    <li><b>定期存檔：</b>每 15 分鐘存一次索引，把「最多需要重掃多少」限制在一個區間內。存檔動作切成 20 份分次執行，因為一次存完會讓系統停頓 25 秒。</li>
+  </ul>
+
+  <h3>分成兩個行程，為什麼對合規是安全的</h3>
+  <ul class="b">
+    <li><b>核心保證：</b>每個行程擁有一組<strong>互不重疊</strong>的網站，用網域名稱的雜湊值決定歸屬。每個網站的請求都由固定的同一個行程發出，<strong>所以 5 秒計時器永遠不需要跨行程協調</strong>。</li>
+    <li><b>為什麼需要交接：</b>廣度爬蟲幾乎每個新網站都是透過跨站連結發現的。如果丟掉不屬於自己的網址，兩個行程會各自孤立地抓，網站數幾乎不成長。</li>
+    <li><b>接收端會驗證所有權</b>，不信任寄送方。兩個行程同時抓一個網站是分片唯一不能有的錯誤。</li>
+    <li><b>交接的網址不重複計數</b>，否則發現總數會按跨行程的次數膨脹。</li>
+    <li><b>實測效果：</b>2 個行程對 1 個行程是每秒 53.09 頁對 25.51 頁，<strong>2.08 倍</strong>，記憶體 1.60 倍。兩個核心都維持 97% 以上的使用率。</li>
+  </ul>
+
+  <h3>資料流</h3>
+  <div class="flow">
+<pre>1,000 個起始網址
+      │
+  ┌───┴─────────────────────────────────────────────┐
+  │  行程 0                行程 1                    │  網域雜湊 % 2
+  │    ▼                     ▼                       │  每個網站固定歸一個行程
+  │  解析頁面 ── 用正則抽連結（不建 DOM 樹，快 5-8 倍）
+  │    ▼
+  │  正規化 ── 過濾長度 / 深度 / 副檔名 / session id
+  │    ▼
+  │  ① 單一網站上限檢查     ┐ 順序刻意如此：
+  │  ② 歸屬判斷 → 交接      │ 去重會留下記錄，
+  │  ③ 去重過濾             ┘ 所以放最後
+  │    ▼
+  │  寫入「發現」紀錄檔  ← Tier 1 指標①
+  │    ▼
+  │  待抓清單（磁碟，可從強制終止復原）
+  │    ├── 網站佇列數 < 40,000 ?
+  │    └── 待抓請求數 < 300 萬 ?（新網站有特權）
+  │    ▼
+  │  挑一個空閒網站（環狀掃描，平均檢查 1 個）
+  │    ▼
+  │  記錄送出時間 → 「送出」紀錄檔  ← 合規證據
+  │  檢查間隔 ≥ 5 秒 ?  否 → 丟棄 + 存下現場
+  │    ▼
+  │  [ 實際發送網路請求 ]
+  │    ▼
+  │  收到回應後：記下完成時刻  ← 下一次的計時起點
+  │    ▼
+  │  寫入「成功」紀錄檔  ← Tier 1 指標②
+  └─────────────────────────────────────────────────┘</pre>
+  </div>
+</section>
+
+<!-- ========== 04 ========== -->
+<section>
+  <p class="snum">04 — 起始網址</p>
+  <h2>1,000 個起始網址怎麼選</h2>
+  <p class="lede">目標不是「找 1,000 個熱門網站」。每個起始網址開啟一條獨立的 5 秒管線，所以真正的目標是<strong>最大化相異網站與國家／類別的覆蓋</strong>，並確保每一個都真的產出可追蹤的連結。</p>
+
+  <div class="funnel">
+    <div class="fstep">
+      <span class="fstep-n">IN</span>
+      <div class="fstep-b">
+        <div class="fstep-t">Tranco 全球網站排名</div>
+        <p class="fstep-d">學術用排名，把四個商業排名在 30 天內平均以抵抗人為操縱，因此可在報告中引用。取前 20,000 名當選取池。</p>
+      </div>
+      <div class="fstep-v">1,000,000<small>ranked</small></div>
+    </div>
+    <div class="fstep">
+      <span class="fstep-n">① 濾</span>
+      <div class="fstep-b">
+        <div class="fstep-t">去掉基礎設施主機</div>
+        <p class="fstep-d">用 42 個關鍵字比對，例如 <code>gstatic</code>、<code>akamai</code>、<code>amazonaws</code>、<code>awsdns</code>。這些網域排名很高，但它們提供靜態檔案、API 或 DNS 服務，<strong>頁面上沒有可追蹤的連結</strong>。</p>
+      </div>
+      <div class="fstep-v">−4%<small>of pool</small></div>
+    </div>
+    <div class="fstep">
+      <span class="fstep-n">② 去重</span>
+      <div class="fstep-b">
+        <div class="fstep-t">每個註冊域只留一個</div>
+        <p class="fstep-d">爬蟲以註冊域限速，<strong>所以同一個註冊域的第二個主機會共用同一個 5 秒計時器，買不到任何額外並行度</strong>。</p>
+      </div>
+      <div class="fstep-v">dedup<small>per site</small></div>
+    </div>
+    <div class="fstep">
+      <span class="fstep-n">③ 取樣</span>
+      <div class="fstep-b">
+        <div class="fstep-t">按國別／類別配額取樣</div>
+        <p class="fstep-d">每個頂級域（<code>.com</code>、<code>.jp</code> 等）依其在池中的比例分配名額，<strong>單一頂級域上限 35%</strong>，且每個出現過的頂級域至少 1 個名額。</p>
+      </div>
+      <div class="fstep-v">3,000<small>candidates</small></div>
+    </div>
+    <div class="fstep">
+      <span class="fstep-n">④ 實測</span>
+      <div class="fstep-b">
+        <div class="fstep-t">逐一實際抓取驗證</div>
+        <p class="fstep-d">每個候選抓一次，只保留<strong>回應是 HTML 且經過正規化後仍有 5 個以上相異連結</strong>的。這是爬蟲自己會用的同一個判斷，提前跑一次。</p>
+      </div>
+      <div class="fstep-v">3,000<small>probed</small></div>
+    </div>
+    <div class="fstep out">
+      <span class="fstep-n">OUT</span>
+      <div class="fstep-b">
+        <div class="fstep-t">通過驗證 1,348 個，按排名取前 1,000</div>
+        <p class="fstep-d">刻意超額產生候選，因為關鍵字濾不掉全部無連結的網站。全部 HTTPS，涵蓋 38 個頂級域。</p>
+      </div>
+      <div class="fstep-v">1,000<small>seeds</small></div>
+    </div>
+  </div>
+
+  <div class="note key">
+    <span class="note-k">為什麼需要「實際抓一次」這一步</span>
+    <p>關鍵字清單擋不掉全部。<code>aaplimg.com</code>、<code>appsflyersdk.com</code>、<code>googleusercontent.com</code> 三個都排名很高、都能正常連線，但<strong>回傳的頁面沒有任何爬蟲能追蹤的連結</strong>。浪費一個名額的代價是整整 48 小時的一條管線。</p>
+  </div>
+
+  <h4>1,652 個候選被淘汰的原因（實測）</h4>
+  <div class="tw">
+    <table>
+      <caption>驗證階段淘汰分類 — 3,000 個候選</caption>
+      <thead><tr><th>原因</th><th class="num">數量</th><th>說明</th></tr></thead>
+      <tbody>
+        <tr><td>連結數不足（連線正常）</td><td class="num">733</td><td>抓取成功且是 HTML，但可追蹤連結少於 5 個。這是關鍵字濾不掉的那一類。</td></tr>
+        <tr><td>網域無法解析</td><td class="num">446</td><td>排名很高但網站已不存在</td></tr>
+        <tr><td>連線逾時</td><td class="num">173</td><td>10 秒內無回應</td></tr>
+        <tr><td>憑證錯誤</td><td class="num">89</td><td>HTTPS 憑證無效或不匹配</td></tr>
+        <tr><td>重導向迴圈</td><td class="num">87</td><td>—</td></tr>
+        <tr><td>非 HTML 回應</td><td class="num">56</td><td>純文字 25、無型別 18、JSON 7、XML 6</td></tr>
+        <tr><td>其他連線錯誤</td><td class="num">68</td><td>SSL、連線被拒、HTTP 錯誤</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted"><strong>網域無法解析佔 27%</strong>，這個比例本身就是一個發現：Tranco 的排名來自查詢量，而查詢量高不代表網站還活著。驗證程式本身也維持禮貌性——每個註冊域只抓一次，並行度跨網站而非在單一網站內。</p>
+
+  <h4>最終清單的組成</h4>
+  <div class="tw">
+    <table>
+      <caption>起始網址清單特性</caption>
+      <thead><tr><th>項目</th><th class="num">值</th><th>意義</th></tr></thead>
+      <tbody>
+        <tr><td>起始網址數</td><td class="num">1,000</td><td>作業允許的上限</td></tr>
+        <tr><td>相異註冊域</td><td class="num">1,000</td><td>每個都是獨立的 5 秒管線</td></tr>
+        <tr><td>相異頂級域</td><td class="num">38</td><td>候選池有 543 個，配額取樣後保留 38 個</td></tr>
+        <tr><td><code>.com</code> 佔比</td><td class="num">48.0%</td><td>池中是 55%，配額上限把它壓下來</td></tr>
+        <tr><td>每頁連結數中位數</td><td class="num">77</td><td>四分位 36 / 77 / 149，最高 3,819</td></tr>
+        <tr><td>協定</td><td class="num">100% HTTPS</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>頂級域分佈前 8 名</caption>
+      <thead><tr><th>頂級域</th><th class="num">數量</th><th>頂級域</th><th class="num">數量</th></tr></thead>
+      <tbody>
+        <tr><td class="mn">.com</td><td class="num">480</td><td class="mn">.net</td><td class="num">38</td></tr>
+        <tr><td class="mn">.org</td><td class="num">81</td><td class="mn">.io</td><td class="num">35</td></tr>
+        <tr><td class="mn">.ru</td><td class="num">50</td><td class="mn">.jp</td><td class="num">31</td></tr>
+        <tr><td class="mn">.de</td><td class="num">42</td><td class="mn">.uk</td><td class="num">20</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ========== 05 ========== -->
+<section>
+  <p class="snum">05 — 程式結構</p>
+  <h2>Codebase 架構</h2>
+  <p class="lede">共 2,902 行 Python，16 個模組。專案基於 Scrapy 框架，而<strong>每個模組的存在理由都是修正一個框架預設值</strong>——那些預設值是對的，只是它們定義在不是本作業所要求的量上。</p>
+
+  <div class="mods">
+    <div class="mgrp">合規關鍵路徑 — 5 個模組</div>
+    <div class="mod"><div class="mod-f">slot.py</div><div class="mod-d">算出每個網址屬於哪個「網站」（註冊域）。框架預設用主機名稱，那會讓 <code>www.x.com</code> 和 <code>cdn.x.com</code> 各跑一個計時器，速率變兩倍。也負責決定網站歸哪個行程。</div></div>
+    <div class="mod"><div class="mod-f">downloader.py</div><div class="mod-d">速率限制器。把計時起點改成「上一個回應完成的時刻」，並把每個網站的完成時間存在會被回收的物件之外，讓它在網站沉寂一段時間後回來時歷史不遺失。</div></div>
+    <div class="mod"><div class="mod-f">dispatch.py</div><div class="mod-d">量測點與最後一道檢查。在開啟網路連線前的最後一刻記錄時間，間隔不足就丟棄。寫出合規證據檔與違規現場檔。</div></div>
+    <div class="mod"><div class="mod-f">middlewares/robots.py</div><div class="mod-d">robots.txt 處理。三處修正：規則快取加上限、讀不到就拒絕、失敗後倍增退避重試。並真正套用 <code>Crawl-delay</code>。</div></div>
+    <div class="mod"><div class="mod-f">middlewares/redirect.py</div><div class="mod-d">重導向處理。重導向是唯一能在「抓取之後」才改變目的地的路徑，所以要重新判斷歸屬並交接，也要重設去重旗標，否則兩個網址互相重導向會無限循環。</div></div>
+
+    <div class="mgrp">資源上限 — 讓 48 小時可行的 4 個模組</div>
+    <div class="mod"><div class="mod-f">scheduler.py</div><div class="mod-d">待抓清單管理。框架完全沒有限制清單大小的設定，這裡加上三個上限，並負責從強制終止中復原、定期存檔。</div></div>
+    <div class="mod"><div class="mod-f">squeue.py</div><div class="mod-d">磁碟佇列。掃描資料檔重建索引（否則續跑會刪掉清單），並移除每個佇列 8.5 KB 從未使用的緩衝區。</div></div>
+    <div class="mod"><div class="mod-f">pqueue.py</div><div class="mod-d">挑選下一個要抓的網站。改成環狀掃描，走到第一個空閒的就停。原本的全掃描佔 52% CPU。</div></div>
+    <div class="mod"><div class="mod-f">dupefilter.py</div><div class="mod-d">去重。用 Bloom filter（機率式集合）把 1 億個網址從 13 GB 降到 240 MB，代價是約 1 萬個網址被誤判為重複。也提供提前檢查，省下四分之三的物件配置。</div></div>
+
+    <div class="mgrp">抓取邏輯 — 4 個模組</div>
+    <div class="mod"><div class="mod-f">spiders/broad.py</div><div class="mod-d">主程式。解析回應、抽取連結、決定追蹤或交接。三個檢查的順序刻意安排：<strong>去重放最後，因為只有它會留下記錄</strong>，被前面條件擋掉的網址日後還能重新被發現。</div></div>
+    <div class="mod"><div class="mod-f">extract.py</div><div class="mod-d">連結抽取。用預編譯正則直接掃位元組，不建 DOM 樹，<strong>快 5 到 8 倍</strong>。解析跑在飽和的那個執行緒上，所以這個差別有意義。</div></div>
+    <div class="mod"><div class="mod-f">filters.py</div><div class="mod-d">網址正規化與陷阱過濾：長度、路徑深度、副檔名、session id。有一行專門讀取網址的 port 欄位——標準函式庫只在讀取時才驗證它，這一行擋掉了曾讓交接功能死掉的畸形網址。</div></div>
+    <div class="mod"><div class="mod-f">handoff.py</div><div class="mod-d">跨行程網址交接。用只能附加的分段檔案，記錄讀取位置以便重啟後續讀。不需要鎖，因為每個檔案只有一個寫入者。</div></div>
+
+    <div class="mgrp">量測與生命週期 — 3 個模組</div>
+    <div class="mod"><div class="mod-f">extensions/runstats.py</div><div class="mod-d">內部取樣器。每 30 秒記錄 25 個欄位，包含外部工具看不到的四個關鍵數字：主執行緒 CPU、事件迴圈延遲、待解析佇列、網站佇列數。每次取樣都把統計寫到磁碟，所以即使行程被強制終止，細分資料也不會遺失。</div></div>
+    <div class="mod"><div class="mod-f">extensions/shutdown.py</div><div class="mod-d">計時關機。先取消停在計時器上等待的請求，再關閉。框架內建的關機會等它們自然排空，實測超過五分鐘還沒完成。</div></div>
+    <div class="mod"><div class="mod-f">logwriter.py</div><div class="mod-d">壓縮紀錄檔的寫入與讀取。因為用附加模式，一個檔案裡會有多段壓縮區塊，讀取器要逐段解碼並跳過損壞的那一段。</div></div>
+  </div>
+
+  <p class="muted">外層還有 <code>ops/run_hour.sh</code> 負責啟動兩個行程、每 30 秒取樣系統資源、磁碟不足就停止，以及在行程自行關閉時重啟它。所有可調參數集中在 <code>config.toml</code>，程式碼中不寫死任何數值。</p>
+</section>
+
+<!-- ========== 06 ========== -->
+<section>
+  <p class="snum">06 — 部署環境</p>
+  <h2>機器規格</h2>
+  <p class="lede">以下為實機查詢結果。</p>
+
+  <div class="tw">
+    <table>
+      <caption>硬體 — Google Compute Engine</caption>
+      <thead><tr><th>項目</th><th>值</th><th>選擇理由</th></tr></thead>
+      <tbody>
+        <tr><td>機型</td><td class="mn">t2d-standard-2</td><td>另一款 e2 機型的 CPU 是共享的，只保證 50% 時間，正好對上先前測試觀察到的 48% 使用率天花板</td></tr>
+        <tr><td>CPU</td><td class="mn">AMD EPYC 7B13 · 2 核心</td><td><strong>專用核心</strong>，無超執行緒</td></tr>
+        <tr><td>記憶體</td><td class="mn">7,934 MB · 無 swap</td><td>無 swap 代表記憶體用完沒有緩衝，只會被強制終止</td></tr>
+        <tr><td>磁碟</td><td class="mn">96 GB SSD</td><td>預算表算出需求 48.2 GB</td></tr>
+        <tr><td>區域</td><td class="mn">us-central1-c</td><td>—</td></tr>
+        <tr><td>供應方式</td><td class="mn">標準（非 Spot）</td><td><strong>Spot 機器無論如何在 24 小時被收回</strong>，而作業要求連續 48 小時</td></tr>
+        <tr><td>網路</td><td class="mn">用掉 12 / 可用 1,570 Mbps</td><td>只用了 0.8%，證明網路不是瓶頸</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="tw">
+    <table>
+      <caption>軟體</caption>
+      <thead><tr><th>元件</th><th>版本</th><th>角色</th></tr></thead>
+      <tbody>
+        <tr><td>Ubuntu</td><td class="mn">24.04.4 LTS</td><td>作業系統</td></tr>
+        <tr><td>Python</td><td class="mn">3.12.3</td><td>以 <code>uv</code> 管理相依套件</td></tr>
+        <tr><td>Scrapy</td><td class="mn">2.19.0 <strong>（版本鎖定）</strong></td><td>爬蟲框架。鎖定是因為本專案複製並修改了它的內部函式，測試會在版本變動時失敗以提醒重新比對</td></tr>
+        <tr><td>Twisted</td><td class="mn">26.4.0</td><td>事件迴圈</td></tr>
+        <tr><td>protego</td><td class="mn">0.6.2</td><td>robots.txt 解析</td></tr>
+        <tr><td>rbloom</td><td class="mn">1.5.4</td><td>Bloom filter 去重</td></tr>
+        <tr><td>tldextract</td><td class="mn">5.3.2</td><td>從網址算出註冊域</td></tr>
+        <tr><td>lxml</td><td class="mn">6.1.3</td><td>HTML 解析</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>記憶體上限為什麼設 2,800 MB</h3>
+  <p>這個數字算錯過一次，而作業系統親自證明了它錯。當時上限設在每行程 3,400 MB，<strong>從未觸發</strong>，因為系統在 3,110 MB 就把行程殺掉了：</p>
+  <div class="proof">
+<pre>Out of memory: Killed process 1761 (scrapy)
+total-vm:4873408kB, anon-rss:3110200kB</pre>
+    <p>上限訂得比真實天花板還高，所以它做不了它的工作。舊算式寫「3,400 × 2 = 6,800，對 7,934 還剩 1.1 GB」，漏掉三件事。</p>
+  </div>
+  <ol class="n">
+    <li><strong>檔案快取。</strong>執行中系統顯示約 3,000 MB 被用作磁碟快取，而系統不會為了滿足程式的記憶體需求就全部釋放它。</li>
+    <li><strong>核心自己的開銷。</strong>峰值 269,087 個開啟的檔案，每個在核心裡都有對應結構，合計 300 到 400 MB，<strong>而這些完全不計入程式的記憶體使用量</strong>。</li>
+    <li><strong>當初的估算是在功能不完整時做的。</strong>跨行程交接修好後網站數多了 43%，真實用量是 3,000 到 3,180 MB，而非估的 2,800。</li>
+  </ol>
+  <div class="note key">
+    <span class="note-k">還有一個容易漏掉的機制</span>
+    <p>框架的記憶體監控讀的是<strong>歷史最高值</strong>，不是當前值。所以一次瞬間尖峰會永久觸發上限，之後回收多少記憶體都無法讓讀數降回來。<strong>餘裕必須覆蓋尖峰，不只是穩定狀態。</strong></p>
+  </div>
+  <ul class="b">
+    <li><b>觸發自家上限 = 乾淨關閉。</b>走的是和計時關機同一條路徑，所以紀錄檔、去重資料、統計全部保住，監督程式會在原有的待抓清單上重啟它。</li>
+    <li><b>撞到物理記憶體 = 強制終止。</b>什麼都來不及存。這就是這個數字必須低到能被先觸發的全部理由。</li>
+    <li><b>實測結果：</b>48 小時峰值 2,716 MB，<strong>硬上限從未觸發</strong>，警告線（2,400 MB）依設計觸發一次。</li>
+  </ul>
+
+  <h3>磁碟預算</h3>
+  <div class="tw">
+    <table>
+      <caption>48 小時磁碟需求估算 vs 實際</caption>
+      <thead><tr><th>項目</th><th class="num">估算</th></tr></thead>
+      <tbody>
+        <tr><td>待抓清單（2 個行程各一份）</td><td class="num">4.0 GB</td></tr>
+        <tr><td>待抓清單尚未回收的空間</td><td class="num">17.8 GB</td></tr>
+        <tr><td>網站佇列目錄</td><td class="num">1.0 GB</td></tr>
+        <tr><td>紀錄檔（壓縮後）</td><td class="num">8.3 GB</td></tr>
+        <tr><td>去重資料</td><td class="num">0.5 GB</td></tr>
+        <tr><td>結束時的歸檔複製</td><td class="num">8.3 GB</td></tr>
+        <tr><td>系統與相依套件</td><td class="num">8.0 GB</td></tr>
+        <tr><td><strong>合計</strong></td><td class="num"><strong>48.2 GB</strong></td></tr>
+        <tr><td><strong>實際用量</strong></td><td class="num ok"><strong>12 GB</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">實際遠低於估算，因為估算把「填充階段」的磁碟成長率當成穩定狀態。填充期兩個行程合計約 5,150 MB/h，但達到上限後降到 190 MB/h（單行程）。實際 48 小時只用了 12 GB。</p>
+</section>
+
+<!-- ========== 07 ========== -->
+<section>
+  <p class="snum">07 — 實作問題</p>
+  <h2>實作中遇到的問題</h2>
+  <p class="lede">六個問題，依發現順序。其中三個是我自己造成或暴露的，我一併列出，因為隱藏它們會讓這份報告失去參考價值。</p>
+
+  <div class="prob mine">
+    <div class="prob-h">
+      <span class="prob-t">第 36.9 小時被作業系統中斷</span>
+      <span class="tag tag-o">我的部署疏漏</span>
+    </div>
+    <dl>
+      <dt>現象</dt><dd>執行到第 36.9 小時，兩個行程同時收到中斷訊號並結束。</dd>
+      <dt>根因</dt><dd>Linux 的 systemd 預設會在「使用者最後一個登入連線結束」時清理該使用者的所有行程。我每 30 分鐘用 SSH 登入查看進度，登出後 systemd 判定沒有活躍連線，就把爬蟲一起清掉了。要避免必須先執行 <code>loginctl enable-linger</code>，而部署文件裡沒有這一步。</dd>
+      <dt>排除</dt><dd>不是重開機、不是記憶體不足、不是程式錯誤。早期測試最長只跑 2 小時且全程保持連線，所以這個問題從未浮現。</dd>
+      <dt>處理</dt><dd>開啟該設定後續跑剩餘時數。<strong>紀錄檔是附加模式且從未清除，所以資料連續涵蓋整個 48 小時。</strong></dd>
+    </dl>
+  </div>
+
+  <div class="note key">
+    <span class="note-k">意外收穫：這次中斷成了最強的復原證據</span>
+    <p>中斷訊號是立即的，沒有任何乾淨關閉的機會。但待抓清單（每行程 2.3 GB、約 28,000 個佇列目錄）和去重資料（240 MB）<strong>全部完整存活</strong>。續跑後 31 秒的第一筆紀錄顯示待抓清單有 32,524 筆——<strong>非零</strong>。對照前一輪測試，重啟後每一筆紀錄都是 0 而且抓不到任何頁面。<strong>那個缺陷確實修好了，而一次非預期的中斷在真實資料上證明了它，比任何測試都有力。</strong></p>
+  </div>
+
+  <div class="prob mine">
+    <div class="prob-h">
+      <span class="prob-t">我的統計程式把爬蟲的記憶體吃掉了</span>
+      <span class="tag tag-o">我的工具錯誤</span>
+    </div>
+    <dl>
+      <dt>起因</dt><dd>我要統計紀錄檔行數來回報 Tier 1 指標。我剛寫的讀取程式把整個 1 GB 檔案讀進記憶體，用量衝到 3,435 MB，作業系統選中它強制終止。</dd>
+      <dt>第二個錯誤</dt><dd>我以為降低行程優先權（<code>nice</code>）能保護爬蟲。<strong>但 <code>nice</code> 管的是 CPU 排程，不管記憶體配置。</strong>當時的限制是記憶體，所以它完全沒有作用。</dd>
+      <dt>影響</dt><dd>爬蟲未被殺，資料無損失，兩個行程都存活。暫時代價是 CPU 一度降到 49%、事件迴圈延遲尖峰 18,677 毫秒、我的 SSH 連線失敗 5 次，數分鐘內恢復。</dd>
+      <dt>但這是運氣</dt><dd>作業系統挑選終止對象的依據是記憶體用量，當時我的程式用最多所以被挑中。<strong>若爬蟲用量再高一些，被挑中的可能是爬蟲。</strong>在一台只有 7.9 GB 而爬蟲已用 3.8 GB 的機器上，我不該執行任何吃記憶體的分析工作。</dd>
+      <dt>修法</dt><dd>改成每次只讀 1 MB。測試直接斷言<strong>峰值記憶體與檔案大小無關</strong>：4 倍大的檔案，峰值不得超過 1.5 倍。實測 7.2 MB 與 28.8 MB 的檔案都是 104 MB。</dd>
+    </dl>
+  </div>
+
+  <div class="prob fixed">
+    <div class="prob-h">
+      <span class="prob-t">紀錄檔讀取器會在損壞處停止，少報整段資料</span>
+      <span class="tag tag-f">已修</span>
+    </div>
+    <dl>
+      <dt>問題</dt><dd>紀錄檔用附加模式，所以<strong>一個檔案裡有多段獨立的壓縮區塊</strong>，每次程式啟動一段。標準解壓函式在第一個損壞的區塊就停止，會漏掉續跑後寫入的每一筆。</dd>
+      <dt>量化</dt><dd>中斷後實測：標準函式回傳 3,607,540 行，實際有 3,624,753 行。<strong>若不修，Tier 1 指標會少報整個第二段。</strong></dd>
+      <dt>我第一次修錯了</dt><dd>我用「搜尋壓縮區塊的起始標記」來找邊界。<strong>那三個位元組會偶然出現在壓縮資料內部</strong>，所以它把完整的區塊切成兩半：3,607,540 行掉到 425,483 行，<strong>少了 88%</strong>。我立刻還原線上版本、重新驗證回原值，並確認爬蟲完全未受影響。</dd>
+      <dt>正確做法</dt><dd>完整的區塊信任解壓器自己回報的結束位置；<strong>只對損壞的區塊才搜尋</strong>下一個起始標記。另外，損壞區塊尾端的殘片必須丟棄而非接到下一段——我的第一版把它們黏起來，<strong>製造出一筆從未存在的紀錄</strong>。測試現在明確斷言零拼接。</dd>
+    </dl>
+  </div>
+
+  <div class="prob">
+    <div class="prob-h">
+      <span class="prob-t">畸形的網址 port 會讓整頁連結遺失</span>
+      <span class="tag tag-o">未修</span>
+    </div>
+    <dl>
+      <dt>現象</dt><dd>頁面上有形如 <code>http://host:-vva/path</code> 的連結，冒號後不是數字，標準函式庫拋出錯誤。</dd>
+      <dt>影響</dt><dd>比一個壞連結更廣。解析函式是逐個產出連結的，所以這個錯誤會中止整個迴圈，<strong>該頁剩餘的每個連結都遺失</strong>，不只那個畸形的。實測 16.5 小時內 6 次，對照 635 萬次請求。</dd>
+      <dt>未修原因</dt><dd>修它需要重啟行程，代價是 16.5 小時的進度，用來修一個百萬分之一的連結遺漏。選擇記錄而非修復。</dd>
+      <dt>修法</dt><dd>把建立請求的動作包在錯誤處理裡，讓一個畸形網址只丟掉自己。</dd>
+    </dl>
+  </div>
+
+  <div class="prob">
+    <div class="prob-h">
+      <span class="prob-t">超長網域名稱造成的請求遺失不被計數</span>
+      <span class="tag tag-o">未修</span>
+    </div>
+    <dl>
+      <dt>根因</dt><dd>建立網站佇列目錄時，程式把網域名稱轉成安全字元後附加雜湊值，<strong>而這個轉換保留原長度</strong>，所以超長網域產生的目錄名超過檔案系統 255 位元組上限，建立目錄失敗。</dd>
+      <dt>影響</dt><dd>錯誤往外傳播，導致計數器沒有增加、函式沒有正常返回。該請求遺失，<strong>而「被丟棄」的統計不會計入它</strong>，因為它從未走到任何丟棄路徑。實測 16.5 小時內 47 次。</dd>
+      <dt>修法</dt><dd>捕捉該錯誤並計入一個統計欄位，讓它可見地丟掉一個請求，而不是變成不可見的遺失。</dd>
+    </dl>
+  </div>
+
+  <h3>驗證為良性的日誌項目</h3>
+  <p>我逐類讀過每個警告和錯誤，而不是只數數量。以下三類確認不是缺陷：</p>
+  <div class="tw">
+    <table>
+      <caption>良性日誌項目 — 16.5 小時時</caption>
+      <thead><tr><th>類型</th><th class="num">次數</th><th>是什麼</th></tr></thead>
+      <tbody>
+        <tr><td>回應過大警告</td><td class="num">48,014</td><td>解壓後超過 512 KB 上限，框架拒收。依設定運作。</td></tr>
+        <tr><td>TLS 警告</td><td class="num">12,063</td><td>遠端網站的 HTTPS 設定問題。</td></tr>
+        <tr><td>Twisted 嚴重錯誤</td><td class="num">3</td><td>遠端網站 TLS 損壞，觸發框架自身錯誤處理器內的例外。非本專案程式碼。</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>為什麼「例外」數量約佔請求數一半</h3>
+  <p>這個比例需要解釋而不是隱藏。把其中 315 萬次拆開：</p>
+  <div class="tw">
+    <table>
+      <caption>例外分類 — shard 0 於 20.5 小時</caption>
+      <thead><tr><th>類型</th><th class="num">次數</th><th class="num">佔比</th><th>性質</th></tr></thead>
+      <tbody>
+        <tr><td>主動放棄抓取</td><td class="num">1,623,550</td><td class="num">51.4%</td><td><span class="ok">合規機制運作中</span>，不是失敗</td></tr>
+        <tr><td>連線逾時</td><td class="num">1,222,466</td><td class="num">38.7%</td><td>真實失敗。廣度爬蟲會遇到大量慢站與死站</td></tr>
+        <tr><td>網域無法解析</td><td class="num">255,533</td><td class="num">8.1%</td><td>網站已不存在</td></tr>
+        <tr><td>其他</td><td class="num">55,595</td><td class="num">1.8%</td><td>連線層失敗</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note key">
+    <span class="note-k">最大的一類是合規機制本身</span>
+    <p>「主動放棄抓取」佔 51.4%，來自兩處：robots.txt 明確禁止，以及規則讀不到而拒絕。換句話說，<strong>一半的「例外」是爬蟲正確地選擇不抓</strong>。我在執行早期把這個比例當成待解問題，資料顯示它一半是設計行為。</p>
+  </div>
+
+</section>
+
+</div>
+</body>
+</html>

@@ -9,7 +9,9 @@ Usage:
     uv run python ops/build_pages.py <source.html>
     uv run python ops/build_pages.py            # uses the default source
 
-Writes docs/index.html, which is what Pages serves.
+Writes docs/index.html, which is what Pages serves at
+https://rexleee.github.io/ntu-sa-crawler/. Commit and push to publish;
+the Pages build takes about 20 seconds.
 """
 
 from __future__ import annotations

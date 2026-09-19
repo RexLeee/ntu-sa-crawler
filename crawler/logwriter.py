@@ -15,6 +15,7 @@ import time
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 
 class GzipLineWriter:
@@ -43,6 +44,37 @@ class GzipLineWriter:
 
 _GZIP_MAGIC = b"\x1f\x8b\x08"
 _READ_CHUNK = 1 << 20
+
+
+def _split_lines(buf: bytes) -> tuple[bytes, list[str]]:
+    """Split on newlines, returning (incomplete tail, complete lines)."""
+    if b"\n" not in buf:
+        return buf, []
+    head, _, tail = buf.rpartition(b"\n")
+    lines = head.decode("utf-8", errors="replace").split("\n")
+    return tail, [ln + "\n" for ln in lines]
+
+
+def _find_next_member(raw: BinaryIO, pos: int, size: int) -> int:
+    """Byte offset of the next gzip header after pos, or -1.
+
+    Scans in windows rather than loading the file. A 1 GB log read whole cost
+    3.4 GB of RSS once decompression buffers were added, and the OOM killer
+    took the process on the 7.9 GB crawl host while two shards were running.
+    """
+    window = _READ_CHUNK
+    start = pos + 3
+    overlap = len(_GZIP_MAGIC) - 1
+    while start < size:
+        raw.seek(start)
+        block = raw.read(window + overlap)
+        if not block:
+            return -1
+        found = block.find(_GZIP_MAGIC)
+        if found >= 0:
+            return start + found
+        start += window
+    return -1
 
 
 def _decode_bounded(blob: bytes) -> list[bytes]:
@@ -87,74 +119,69 @@ def read_lines(path: Path | str) -> Iterator[str]:
     path = Path(path)
     damaged = 0
     truncated_lines = 0
-    with path.open("rb") as raw:
-        data = raw.read()
+    size = path.stat().st_size
 
-    pos = 0
-    size = len(data)
-    while pos < size:
-        decomp = zlib.decompressobj(31)  # 31 = gzip wrapper, not raw deflate
-        chunks: list[bytes] = []
-        try:
-            pending = data[pos:]
+    with path.open("rb") as raw:
+        pos = 0
+        while pos < size:
+            raw.seek(pos)
+            decomp = zlib.decompressobj(31)  # 31 = gzip wrapper, not raw deflate
+            carry = b""  # a record split across two read blocks
+            produced = False
+            failed = False
             while True:
-                chunks.append(decomp.decompress(pending, _READ_CHUNK))
+                block = raw.read(_READ_CHUNK)
+                if not block:
+                    failed = not decomp.eof  # ran out with no end-of-stream mark
+                    break
+                try:
+                    out = decomp.decompress(block)
+                except (zlib.error, gzip.BadGzipFile):
+                    failed = True
+                    break
+                if out:
+                    produced = True
+                    carry, whole = _split_lines(carry + out)
+                    yield from whole
                 if decomp.eof:
                     break
-                # unconsumed_tail is the input held back by max_length; feeding
-                # it back is what advances the member. Passing b"" instead
-                # stalls, and the member then looks truncated even when it is
-                # intact.
-                pending = decomp.unconsumed_tail
-                if not pending:
-                    # Input exhausted with no end-of-stream marker: the writer
-                    # was killed partway through this member.
-                    raise EOFError("member truncated")
-            # unused_data is the decoder's own report of where this member
-            # ended. Trust it rather than searching for the next header: the
-            # three magic bytes occur by chance inside compressed data, and an
-            # earlier version of this function searched for them and cut
-            # intact members in half, reading 425,483 of 3,607,540 lines from
-            # a real 1 GB log.
-            consumed = size - pos - len(decomp.unused_data)
-            intact = True
-        except (EOFError, zlib.error, gzip.BadGzipFile):
-            # Damaged: the decoder cannot say where this member ends, so the
-            # next header has to be searched for. A false positive here costs
-            # nothing extra, because the member is already unreadable.
-            damaged += 1
-            intact = False
-            nxt = data.find(_GZIP_MAGIC, pos + 3)
-            consumed = (nxt - pos) if nxt > 0 else (size - pos)
-            if not chunks and nxt > 0:
-                # Unbounded, a truncated member reads the NEXT member's bytes
-                # as a corrupt continuation of itself and fails before
-                # delivering anything. Bounded by the next header it fails
-                # cleanly instead, keeping the records it had already decoded.
-                chunks = _decode_bounded(data[pos:nxt])
-        body = b"".join(chunks)
 
-        text = body.decode("utf-8", errors="replace")
-        lines = text.split("\n")
-        # Each member is self-contained: the writer only ever appends whole
-        # lines, so a member that ends mid-line was cut there by the kill.
-        # Carrying that fragment into the next member splices two records into
-        # one fake line. A measured case produced "killed-47post-0", a record
-        # that never existed. Drop the fragment instead, and count it.
-        remainder = lines.pop()
-        if remainder:
-            if intact:
-                # An intact member ending without a newline is the live file
-                # being read mid-write. The record is real and complete enough
-                # for the tools, which parse by column.
-                yield remainder
+            if not failed:
+                # unused_data is the decoder's own report of where this member
+                # ended. Trust it rather than searching for the next header:
+                # the three magic bytes occur by chance inside compressed data,
+                # and an earlier version searched for them, cut intact members
+                # in half, and read 425,483 of 3,607,540 lines from a 1 GB log.
+                consumed = raw.tell() - pos - len(decomp.unused_data)
+                if carry:
+                    # An intact member ending without a newline is the live
+                    # file being read mid-write. That record is real.
+                    yield carry.decode("utf-8", errors="replace")
             else:
-                truncated_lines += 1
-        yield from (ln + "\n" for ln in lines)
+                damaged += 1
+                # The decoder cannot say where a damaged member ends, so the
+                # next header has to be found. A false positive costs nothing
+                # here: this member is already unreadable.
+                nxt = _find_next_member(raw, pos, size)
+                consumed = (nxt - pos) if nxt > 0 else (size - pos)
+                if not produced and nxt > 0:
+                    # Unbounded, a truncated member reads the NEXT member's
+                    # bytes as a corrupt continuation and delivers nothing.
+                    # Bounded by the next header it fails cleanly instead,
+                    # keeping the records it had already decoded.
+                    raw.seek(pos)
+                    for chunk in _decode_bounded(raw.read(nxt - pos)):
+                        carry, whole = _split_lines(carry + chunk)
+                        yield from whole
+                # A fragment at a damaged member's end was cut mid-record.
+                # Carrying it into the next member splices two records into a
+                # line that never existed, such as "killed-47post-0".
+                if carry:
+                    truncated_lines += 1
 
-        if consumed <= 0:
-            break
-        pos += consumed
+            if consumed <= 0:
+                break
+            pos += consumed
 
     if truncated_lines:
         print(

@@ -99,6 +99,57 @@ def test_clean_files_are_unchanged() -> bool:
     return ok
 
 
+def test_memory_does_not_scale_with_file_size() -> bool:
+    """Reading must stream, not load the file.
+
+    An earlier version read the whole file so it could search for member
+    boundaries with bytes.find. On a real 1 GB log that reached 3.4 GB RSS
+    once the decompression buffers were counted, and the OOM killer took the
+    process on the 7.9 GB crawl host while two shards were running. The
+    counting job died; the crawl survived, but only by luck of which process
+    the kernel picked.
+    """
+    import tracemalloc
+
+    from crawler.logwriter import read_lines
+
+    ok = True
+    peaks: list[tuple[int, float, float]] = []
+    for rows in (1_500_000, 6_000_000):
+        big = Path(f"/tmp/test_logwriter_big_{rows}.log.gz")
+        if big.exists():
+            big.unlink()
+        with gzip.open(big, "wt", encoding="utf-8", newline="\n") as fh:
+            for i in range(rows):
+                fh.write(f"{i}\thttps://example.com/page/{i}\t200\ttext/html\t7\t4096\n")
+
+        tracemalloc.start()
+        n = sum(1 for _ in read_lines(big))
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        on_disk = big.stat().st_size / (1024 * 1024)
+        peaks.append((rows, on_disk, peak / (1024 * 1024)))
+        if n != rows:
+            print(f"FAIL: read {n} of {rows} rows")
+            ok = False
+        big.unlink()
+
+    for rows, on_disk, peak_mb in peaks:
+        print(f"       {rows:>9} rows, {on_disk:5.1f} MB on disk -> peak {peak_mb:5.1f} MB")
+
+    # The guarantee is that peak memory is set by the read block size, not by
+    # the file. A 4x larger file must not cost meaningfully more.
+    small_peak = peaks[0][2]
+    large_peak = peaks[-1][2]
+    if large_peak > small_peak * 1.5:
+        print(f"FAIL: peak grew from {small_peak:.0f} to {large_peak:.0f} MB with size")
+        print("      The reader is buffering the file instead of streaming it.")
+        ok = False
+    if ok:
+        print(f"PASS: peak memory flat at ~{large_peak:.0f} MB across a 4x size range")
+    return ok
+
+
 def main() -> int:
     from crawler.logwriter import read_lines
 
@@ -149,6 +200,8 @@ def main() -> int:
         print(f"PASS: 100 before + {killed} partial + 200 after, no spliced lines")
 
     if not test_clean_files_are_unchanged():
+        ok = False
+    if not test_memory_does_not_scale_with_file_size():
         ok = False
     return 0 if ok else 1
 

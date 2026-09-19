@@ -97,19 +97,13 @@ h1{
 }
 .fact-v{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--ink)}
 
-/* ===== live banner ===== */
+/* ===== status banner ===== */
 .live{
   display:flex;flex-wrap:wrap;gap:12px;align-items:center;
   background:var(--amber-bg);border:1px solid var(--amber);border-left-width:3px;
   padding:14px 16px;margin-block:0 34px;
 }
-.dot{width:8px;height:8px;border-radius:50%;background:var(--amber);flex:none;animation:p 2.4s ease-in-out infinite}
-@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
-@media (prefers-reduced-motion:reduce){.dot{animation:none}}
 .live-t{font-size:14.5px;line-height:1.55;flex:1 1 320px;min-width:0;margin:0}
-.bar{flex:1 1 180px;min-width:150px;height:7px;background:var(--surface);border:1px solid var(--rule2);position:relative;overflow:hidden}
-.bar i{position:absolute;inset:0 auto 0 0;width:98.4%;background:var(--amber)}
-.bar-n{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--amber);flex:none}
 
 /* ===== sections ===== */
 section{padding-block:44px;border-bottom:1px solid var(--rule)}
@@ -277,7 +271,7 @@ tbody tr:last-child td{border-bottom:0}
 <header class="mast">
   <p class="kicker">NTU IM · 系統架構師的鍛造與培育 · Starter Project · 2026-09-19</p>
   <h1>禮貌性優先的分散式廣度爬蟲</h1>
-  <p class="standfirst">在一台兩核心、7.9 GB 記憶體的機器上連續執行 48 小時，發現 1.76 億個網址、成功抓取 937 萬頁，全程對每個網站的請求速率零違規。</p>
+  <p class="standfirst">在一台兩核心、7.9 GB 記憶體的機器上連續執行 48 小時，發現 1.78 億個網址、成功抓取 950 萬頁，全程對每個網站的請求速率零違規。</p>
   <p class="repo"><a href="https://github.com/RexLeee/ntu-sa-crawler" target="_blank" rel="noopener">github.com/RexLeee/ntu-sa-crawler</a><span>原始碼</span></p>
 </header>
 
@@ -285,16 +279,13 @@ tbody tr:last-child td{border-bottom:0}
   <div class="fact"><div class="fact-k">執行時數</div><div class="fact-v">48 小時</div></div>
   <div class="fact"><div class="fact-k">機器</div><div class="fact-v">2 vCPU / 7.9 GB</div></div>
   <div class="fact"><div class="fact-k">起始網址</div><div class="fact-v">1,000 個</div></div>
-  <div class="fact"><div class="fact-k">發現網址</div><div class="fact-v">176 M</div></div>
-  <div class="fact"><div class="fact-k">成功抓取</div><div class="fact-v">9.4 M</div></div>
+  <div class="fact"><div class="fact-k">發現網址</div><div class="fact-v">178 M</div></div>
+  <div class="fact"><div class="fact-k">成功抓取</div><div class="fact-v">9.5 M</div></div>
   <div class="fact"><div class="fact-k">速率違規</div><div class="fact-v ok" style="color:var(--green)">0</div></div>
 </div>
 
-<div class="live">
-  <span class="dot" aria-hidden="true"></span>
-  <p class="live-t">本報告在爬蟲執行中發布。標記 <span class="tag tag-l">Live</span> 的數字會在台灣時間今晚 21:14 結束後更新為最終值，連結不變。標記 <span class="tag tag-f">Final</span> 的已定稿。</p>
-  <div class="bar" role="img" aria-label="進度 47 小時，共 48 小時"><i></i></div>
-  <span class="bar-n">47 / 48 h</span>
+<div class="live" style="background:var(--green-bg);border-color:var(--green)">
+  <p class="live-t" style="flex:1 1 100%"><strong>執行完成。</strong>48 小時已跑滿，兩個行程都以正常的時間到期原因結束。本頁每一個數字都是最終值，取自紀錄檔的實際行數，不再變動。</p>
 </div>
 
 <!-- ========== 01 ========== -->
@@ -305,25 +296,25 @@ tbody tr:last-child td{border-bottom:0}
 
   <div class="t1grid">
     <div class="t1">
-      <div class="t1-k">發現的網址總數 <span class="tag tag-l">Live</span></div>
-      <div class="t1-v">175,559,003</div>
-      <p class="t1-d">去重後的相異網址。爬蟲在每頁的連結中找到它們，經過正規化與去重後計數。</p>
+      <div class="t1-k">發現的網址總數 <span class="tag tag-f">Final</span></div>
+      <div class="t1-v">177,579,733</div>
+      <p class="t1-d">去重後的相異網址。爬蟲在每頁的連結中找到它們，經過正規化與去重後計數。這個數字是直接數紀錄檔的行數得到的，不是讀計數器。</p>
     </div>
     <div class="t1">
-      <div class="t1-k">成功抓取的網址總數 <span class="tag tag-l">Live</span></div>
-      <div class="t1-v">9,367,372</div>
-      <p class="t1-d">每一筆都實際收到伺服器回應。平均每小時約 21.8 萬頁。</p>
+      <div class="t1-k">成功抓取的網址總數 <span class="tag tag-f">Final</span></div>
+      <div class="t1-v">9,499,288</div>
+      <p class="t1-d">每一筆都實際收到伺服器回應，而且每一筆的狀態碼都是 2xx。平均每小時 19.8 萬頁。</p>
     </div>
     <div class="t1">
-      <div class="t1-k">觸及的網站數 <span class="tag tag-l">Live</span></div>
-      <div class="t1-v">≈ 1.2 M</div>
-      <p class="t1-d">以「註冊域」計算，例如 <code>example.com</code>。這是速率限制的單位。</p>
+      <div class="t1-k">觸及的網站數 <span class="tag tag-f">Final</span></div>
+      <div class="t1-v">1,558,444</div>
+      <p class="t1-d">以「來源站」計算。速率限制的單位是註冊域，例如 <code>example.com</code>，共 477 萬個。</p>
     </div>
   </div>
 
   <div class="note key">
-    <span class="note-k">為什麼發現的數量是抓取的 20 倍</span>
-    <p>這不是失敗，而是規則造成的必然結果。每抓一頁平均找到 49 個新連結，但抓那一頁就用掉了該網站 5 秒的配額。<strong>新網址進來的速度是能抓走的 33 倍</strong>，所以待抓清單永遠在成長。48 小時內能抓到的量，由「同時持有多少個網站」乘上時間決定，不由清單長度決定。</p>
+    <span class="note-k">為什麼發現的數量是抓取的 18.7 倍</span>
+    <p>這不是失敗，而是規則造成的必然結果。每抓一頁平均找到 19 個新網址，但抓那一頁就用掉了該網站 5 秒的配額。<strong>新網址進來的速度遠高於能抓走的速度</strong>，所以待抓清單永遠在成長。48 小時內能抓到的量，由「同時持有多少個網站」乘上時間決定，不由清單長度決定。</p>
   </div>
 
   <h3>sitemap 為什麼確定被排除</h3>
@@ -332,14 +323,14 @@ tbody tr:last-child td{border-bottom:0}
   <h3>回應狀態分佈</h3>
   <div class="tw">
     <table>
-      <caption>HTTP 狀態碼 — part 1 shard 0，共 799 萬個回應</caption>
+      <caption>HTTP 狀態碼 — 最後一段的兩個行程合計，共 432 萬個回應</caption>
       <thead><tr><th>狀態碼</th><th class="num">數量</th><th class="num">佔比</th><th>意義</th></tr></thead>
       <tbody>
-        <tr><td class="mn">200 OK</td><td class="num">5,965,342</td><td class="num">74.6%</td><td>成功取得頁面</td></tr>
-        <tr><td class="mn">301 / 302 / 308</td><td class="num">1,156,474</td><td class="num">14.5%</td><td>重導向，爬蟲最多跟隨 2 次</td></tr>
-        <tr><td class="mn">404 Not Found</td><td class="num">642,994</td><td class="num">8.0%</td><td>頁面已不存在</td></tr>
-        <tr><td class="mn">403 Forbidden</td><td class="num">126,507</td><td class="num">1.6%</td><td>伺服器拒絕</td></tr>
-        <tr><td class="mn">其他</td><td class="num">101,942</td><td class="num">1.3%</td><td>408 逾時、429 限流等</td></tr>
+        <tr><td class="mn">2xx 成功</td><td class="num">3,349,432</td><td class="num">77.5%</td><td>成功取得頁面，只有這些計入 Tier 1</td></tr>
+        <tr><td class="mn">3xx 重導向</td><td class="num">596,615</td><td class="num">13.8%</td><td>爬蟲最多跟隨 2 次</td></tr>
+        <tr><td class="mn">404 Not Found</td><td class="num">258,613</td><td class="num">6.0%</td><td>頁面已不存在</td></tr>
+        <tr><td class="mn">403 Forbidden</td><td class="num">72,856</td><td class="num">1.7%</td><td>伺服器拒絕</td></tr>
+        <tr><td class="mn">其他</td><td class="num">44,058</td><td class="num">1.0%</td><td>408 逾時、429 限流、5xx 等</td></tr>
       </tbody>
     </table>
   </div>
@@ -350,11 +341,11 @@ tbody tr:last-child td{border-bottom:0}
       <caption>48 小時資源用量 vs 上限</caption>
       <thead><tr><th>資源</th><th class="num">上限</th><th class="num">實測峰值</th><th>結果</th></tr></thead>
       <tbody>
-        <tr><td>記憶體（每行程）</td><td class="num">2,800 MB</td><td class="num">2,716 MB</td><td><span class="ok">未觸發</span>，餘裕 84 MB</td></tr>
+        <tr><td>記憶體（每行程）</td><td class="num">2,800 MB</td><td class="num">2,707 MB</td><td><span class="ok">未觸發</span>，餘裕 93 MB</td></tr>
         <tr><td>檔案描述符</td><td class="num">1,048,576</td><td class="num">93,213</td><td><span class="ok">遠低於上限</span></td></tr>
-        <tr><td>磁碟</td><td class="num">96 GB</td><td class="num">12 GB 已用</td><td><span class="ok">剩餘 84 GB</span></td></tr>
-        <tr><td>被作業系統強制終止</td><td class="num">0 次</td><td class="num">0 次</td><td><span class="ok">爬蟲全程存活</span></td></tr>
-        <tr><td>非預期重啟</td><td class="num">—</td><td class="num">0 次</td><td><span class="ok">監督日誌為空</span></td></tr>
+        <tr><td>磁碟</td><td class="num">96 GB</td><td class="num">18 GB 已用</td><td><span class="ok">剩餘 78 GB</span></td></tr>
+        <tr><td>爬蟲被作業系統終止</td><td class="num">0 次</td><td class="num">0 次</td><td><span class="ok">兩個行程全程存活</span></td></tr>
+        <tr><td>非預期重啟</td><td class="num">—</td><td class="num">0 次</td><td><span class="ok">監督日誌只有兩筆正常結束紀錄</span></td></tr>
       </tbody>
     </table>
   </div>
@@ -403,7 +394,7 @@ tbody tr:last-child td{border-bottom:0}
   <div class="verdict">
     <div class="v-row">
       <span class="v-n">0</span>
-      <span class="v-h">違規，橫跨 2,180 萬次請求</span>
+      <span class="v-h">違規，橫跨 2,678 萬次請求、477 萬個網站</span>
     </div>
     <p>記錄違規的兩個檔案全程皆為 0 bytes，且檔案時間戳停在爬蟲啟動那一刻，證明它從頭到尾沒被寫入過。程式內的檢查器計數為零。</p>
   </div>
@@ -463,7 +454,7 @@ A 送出  ≤  A 完成             ← 回應必定晚於送出
   <ul class="b">
     <li><b>問題：</b>成功頁面的紀錄檔是在解析頁面時寫的，所以只含成功的 HTML。它漏掉每個失敗的請求，以及每次 robots.txt 的抓取——<strong>而這些都真實佔用了該網站的 5 秒配額</strong>。</li>
     <li><b>規模有多大：</b>實測某次執行，45,825 次 robots.txt 抓取有 40,957 次逾時。爬蟲送出的大部分，對「成功紀錄檔」是隱形的。</li>
-    <li><b>所以另外記錄每一次送出：</b>一行一筆，含時間、網站、網址。48 小時共 591 MB 壓縮資料。<strong>合規主張建立在這個檔案上。</strong></li>
+    <li><b>所以另外記錄每一次送出：</b>一行一筆，含時間、網站、網址。48 小時共 2,678 萬筆、710 MB 壓縮資料。<strong>合規主張建立在這個檔案上。</strong></li>
   </ul>
 
   <h3>robots.txt：讀不到就不抓</h3>
@@ -799,7 +790,7 @@ total-vm:4873408kB, anon-rss:3110200kB</pre>
   <ul class="b">
     <li><b>觸發自家上限 = 乾淨關閉。</b>走的是和計時關機同一條路徑，所以紀錄檔、去重資料、統計全部保住，監督程式會在原有的待抓清單上重啟它。</li>
     <li><b>撞到物理記憶體 = 強制終止。</b>什麼都來不及存。這就是這個數字必須低到能被先觸發的全部理由。</li>
-    <li><b>實測結果：</b>48 小時峰值 2,716 MB，<strong>硬上限從未觸發</strong>，警告線（2,400 MB）依設計觸發一次。</li>
+    <li><b>實測結果：</b>48 小時峰值 2,707 MB，<strong>硬上限從未觸發</strong>，警告線（2,400 MB）依設計觸發一次。</li>
   </ul>
 
   <h3>磁碟預算</h3>
@@ -820,7 +811,7 @@ total-vm:4873408kB, anon-rss:3110200kB</pre>
       </tbody>
     </table>
   </div>
-  <p class="muted">實際遠低於估算，因為估算把「填充階段」的磁碟成長率當成穩定狀態。填充期兩個行程合計約 5,150 MB/h，但達到上限後降到 190 MB/h（單行程）。實際 48 小時只用了 12 GB。</p>
+  <p class="muted">實際遠低於估算，因為估算把「填充階段」的磁碟成長率當成穩定狀態。填充期兩個行程合計約 5,150 MB/h，但達到上限後降到 190 MB/h（單行程）。實際 48 小時只用了 18 GB，96 GB 的磁碟還剩 78 GB。</p>
 </section>
 
 <!-- ========== 07 ========== -->
@@ -871,6 +862,20 @@ total-vm:4873408kB, anon-rss:3110200kB</pre>
       <dt>量化</dt><dd>中斷後實測：標準函式回傳 3,607,540 行，實際有 3,624,753 行。<strong>若不修，Tier 1 指標會少報整個第二段。</strong></dd>
       <dt>我第一次修錯了</dt><dd>我用「搜尋壓縮區塊的起始標記」來找邊界。<strong>那三個位元組會偶然出現在壓縮資料內部</strong>，所以它把完整的區塊切成兩半：3,607,540 行掉到 425,483 行，<strong>少了 88%</strong>。我立刻還原線上版本、重新驗證回原值，並確認爬蟲完全未受影響。</dd>
       <dt>正確做法</dt><dd>完整的區塊信任解壓器自己回報的結束位置；<strong>只對損壞的區塊才搜尋</strong>下一個起始標記。另外，損壞區塊尾端的殘片必須丟棄而非接到下一段——我的第一版把它們黏起來，<strong>製造出一筆從未存在的紀錄</strong>。測試現在明確斷言零拼接。</dd>
+    </dl>
+  </div>
+
+  <div class="prob mine">
+    <div class="prob-h">
+      <span class="prob-t">收尾統計時，我把同一批資料數了兩次</span>
+      <span class="tag tag-f">已修正</span>
+    </div>
+    <dl>
+      <dt>問題</dt><dd>爬蟲分兩段執行，每段結束時會把紀錄檔<strong>複製</strong>一份到該段的資料夾。但寫入端從頭到尾都附加到同一個檔案，所以第二段的「副本」其實包含<strong>兩段的全部資料</strong>，不是第二段自己的部分。</dd>
+      <dt>我原本的算法</dt><dd>把兩個資料夾的行數相加。這樣第一段被算了兩次：成功抓取算成 <strong>1,672 萬</strong>，實際只有 950 萬。<strong>虛報 76%。</strong></dd>
+      <dt>怎麼發現的</dt><dd>數字和執行期間的計數器差太多，不像緩衝區造成的小落差。我去比對三個檔案的第一筆時間戳，<strong>三個都是第一段的啟動時刻</strong>。這就是證據。</dd>
+      <dt>正確做法</dt><dd>只數持續累積的那一份檔案。交叉驗證通過：第一段副本 7,221,257 行，對照計數器 7,221,425，差 168 筆，正好是還沒寫入磁碟的緩衝區。</dd>
+      <dt>啟示</dt><dd>指標對不上時，不要挑順眼的那個數字。<strong>大的落差通常代表算法錯了，不是資料錯了。</strong></dd>
     </dl>
   </div>
 

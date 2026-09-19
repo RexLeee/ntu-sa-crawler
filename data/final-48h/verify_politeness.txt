@@ -1,0 +1,14 @@
+# verify_politeness.py — full 48h dispatched logs
+# run 2026-09-19T13:36:33+00:00
+/home/rex/ntu-sa-crawler/data/dispatched-0.log.gz: dropped 1 line(s) cut in half by a kill
+/home/rex/ntu-sa-crawler/data/dispatched-0.log.gz: 15 damaged gzip member(s) skipped; every intact member was read
+/home/rex/ntu-sa-crawler/data/dispatched-1.log.gz: dropped 1 line(s) cut in half by a kill
+/home/rex/ntu-sa-crawler/data/dispatched-1.log.gz: 17 damaged gzip member(s) skipped; every intact member was read
+source      : dispatched
+files       : 2
+requests    : 26783167
+domains     : 4771574
+limit       : 5.00s per registered domain
+min gap seen: 5.125s
+
+VIOLATIONS  : 0

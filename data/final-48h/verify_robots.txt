@@ -1,0 +1,12 @@
+# verify_robots.py — full 48h crawled logs
+# run 2026-09-19T13:37:35+00:00
+/home/rex/ntu-sa-crawler/data/crawled-0.log.gz: dropped 1 line(s) cut in half by a kill
+/home/rex/ntu-sa-crawler/data/crawled-0.log.gz: 4 damaged gzip member(s) skipped; every intact member was read
+/home/rex/ntu-sa-crawler/data/crawled-1.log.gz: dropped 1 line(s) cut in half by a kill
+/home/rex/ntu-sa-crawler/data/crawled-1.log.gz: 7 damaged gzip member(s) skipped; every intact member was read
+crawled urls   : 9499288
+origins seen   : 1558444
+origins checked: 40 (unreachable robots.txt: 7)
+urls re-checked: 10736
+
+VIOLATIONS     : 0

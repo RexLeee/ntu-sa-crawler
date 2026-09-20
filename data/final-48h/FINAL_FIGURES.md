@@ -68,3 +68,53 @@ Counts are conservative: they can only understate, never overstate.
 | handoff received | 17,030,515 | 23,540,000 |
 
 Total elapsed 132,794 + 40,073 = 172,867s = 48.02h.
+
+---
+
+## The VM is deleted (2026-09-20)
+
+Instance `crawler` and its 100 GB disk are gone. Billing is zero: no instances,
+disks, addresses or snapshots remain in project ntu-sa-crawler-20260915.
+
+Before deleting, the six log files were pulled to `raw-logs/` and checked two
+ways: every file is byte-exact against the VM, and every line count was
+reproduced locally with the streaming reader.
+
+| file | bytes | lines |
+|---|---|---|
+| dispatched-0.log.gz | 373,181,567 | 13,474,869 |
+| dispatched-1.log.gz | 371,221,600 | 13,308,298 |
+| crawled-0.log.gz | 175,901,613 | 4,732,839 |
+| crawled-1.log.gz | 177,147,005 | 4,766,449 |
+| discovered-0.log.gz | 1,208,294,705 | 87,742,550 |
+| discovered-1.log.gz | 1,237,349,886 | 89,837,183 |
+
+discovered total 177,579,733 — matches the reported Tier 1 figure exactly.
+
+`raw-logs/` is gitignored: 3.3 GB, and every file is past GitHub's 100 MB
+ceiling. It exists only on this machine. Back it up elsewhere if the evidence
+has to survive this disk.
+
+## Re-running the verifiers without the VM
+
+    cd <repo>
+    uv run python ops/verify_politeness.py \
+        data/final-48h/raw-logs/dispatched-0.log.gz \
+        data/final-48h/raw-logs/dispatched-1.log.gz
+
+    uv run python ops/verify_robots.py \
+        data/final-48h/raw-logs/crawled-0.log.gz \
+        data/final-48h/raw-logs/crawled-1.log.gz --hosts 40
+
+Both were run on this machine after the transfer. verify_politeness reproduced
+the VM's result exactly: 26,783,167 requests, 4,771,574 domains, min gap 5.125s,
+0 violations. verify_robots re-fetches live robots.txt, so its origin sample
+differs per run; it reported 0 violations over 5 origins as a capability check.
+
+## What was destroyed with the disk, and why it did not matter
+
+state/job-0, job-1 (4.9 GB) and state/handoff (700 MB) were the crawler's
+frontier working state, not evidence. data/run-*/ (6.0 GB) held copies of the
+same logs already saved here. Five commits that looked unpushed on the VM were
+each verified present on origin/main first; the VM's git had simply never
+fetched after the pushes.

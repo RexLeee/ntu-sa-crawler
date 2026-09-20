@@ -39,3 +39,10 @@ seeds/.tranco-*.zip
 # OS
 .DS_Store
 Thumbs.db
+
+# The 48h run's raw logs, pulled back before the VM was deleted. 3.3 GB, and
+# every file is past GitHub's 100 MB ceiling, so they stay local-only. They are
+# the verifiers' input: ops/verify_politeness.py and ops/verify_robots.py run
+# against data/final-48h/raw-logs/. The counts they produce are committed in
+# data/final-48h/FINAL_FIGURES.md.
+data/final-48h/raw-logs/
